@@ -6,6 +6,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/OrbitControls.js';
 
 const $ = (id) => document.getElementById(id);
+const COARSE = window.matchMedia('(pointer: coarse)');   // touch-first device (drives hint text + tap slop)
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const lerp = (a, b, k) => a + (b - a) * k;
 const escapeHtml = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -976,18 +977,23 @@ function initWorld() {
     return o ? o.userData.actorId : null;
   }
   let down = null;
-  const dom = renderer.domElement;
-  dom.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY }; });
-  dom.addEventListener('pointercancel', () => { down = null; });
+  const dom = renderer.domElement, ptrs = new Set();     // active pointers: a 2nd finger turns the gesture into pinch/pan, never a tap
+  dom.addEventListener('pointerdown', (e) => {
+    ptrs.add(e.pointerId);
+    down = ptrs.size > 1 ? null : { x: e.clientX, y: e.clientY };
+  });
+  dom.addEventListener('pointercancel', (e) => { ptrs.delete(e.pointerId); down = null; });
   dom.addEventListener('pointerup', (e) => {
+    ptrs.delete(e.pointerId);
     if (!down) return;
     const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
-    if (moved > 5) return;
+    if (moved > (e.pointerType === 'touch' ? 10 : 5)) return;   // fingers jitter more than a mouse
     const id = pickActor(e);
     if (id) follow(id); else if (followId) unfollow();
   });
   let lastHover = 0;
   dom.addEventListener('pointermove', (e) => {
+    if (e.pointerType !== 'mouse') return;
     const n = performance.now(); if (n - lastHover < 60 || e.buttons || down) return; lastHover = n;   // no raycasts mid-drag
     dom.style.cursor = pickActor(e) ? 'pointer' : 'grab';
   });
@@ -1000,7 +1006,7 @@ function initWorld() {
     renderer.setPixelRatio(pixelRatio());
     renderer.setSize(w, h);
     camera.aspect = w / h;
-    const open = !document.body.classList.contains('aside-closed') && w > 900;
+    const open = !document.body.classList.contains('aside-closed') && w > 900;   // <=900px: bottom sheet, no horizontal offset
     const shift = open ? (asideEl.getBoundingClientRect().width + 16) / 2 : 0;
     usableAspect = (w - shift * 2) / h;
     if (shift) camera.setViewOffset(w, h, shift, 0, w, h); else camera.clearViewOffset();
@@ -1051,10 +1057,10 @@ function initWorld() {
 function updateFollowUi() {
   const hint = $('viewhint');
   document.body.classList.toggle('following', !!followId);
-  if (!followId) { hint.textContent = 'Click an agent to follow · drag to orbit · scroll to zoom'; }
+  if (!followId) { hint.textContent = COARSE.matches ? 'Tap an agent · drag to orbit · pinch to zoom' : 'Click an agent to follow · drag to orbit · scroll to zoom'; }
   else {
     const a = (state && state.agents || []).find((x) => x.id === followId);
-    hint.innerHTML = 'Following <b>' + escapeHtml(a ? a.name : followId) + '</b>' + (a ? ' · ' + escapeHtml(a.status) : '') + ' — click empty space to release';
+    hint.innerHTML = 'Following <b>' + escapeHtml(a ? a.name : followId) + '</b>' + (a ? ' · ' + escapeHtml(a.status) : '') + (COARSE.matches ? ' — tap empty space to release' : ' — click empty space to release');
   }
   document.querySelectorAll('#roster .rrow').forEach((r) => r.classList.toggle('sel', r.dataset.id === followId));
 }
@@ -1335,12 +1341,99 @@ function sendChat() {
 chatSend.addEventListener('click', sendChat);
 chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.isComposing) sendChat(); });
 
+/* ---- mobile bottom sheet (<=900px): peek / half / full, drag the handle or tap to cycle ---- */
+const sheet = (() => {
+  const MQ = window.matchMedia('(max-width: 900px)');
+  const SNAPS = ['peek', 'half', 'full'], body = document.body, aside = document.querySelector('aside');
+  const handle = $('sheethandle');
+  let snap = 'half', drag = null;
+  const px = (cssVar) => {                       // resolve a CSS length (vh/env/max) to px via a probe
+    const p = document.createElement('div');
+    p.style.cssText = 'position:fixed;visibility:hidden;pointer-events:none;width:0;height:var(' + cssVar + ')';
+    body.appendChild(p); const h = p.offsetHeight; p.remove(); return h;
+  };
+  function set(s) {
+    snap = s;
+    SNAPS.forEach((n) => body.classList.toggle('sheet-' + n, n === s));
+    body.style.removeProperty('--sheet-h');
+    if (!MQ.matches) return;
+    handle.setAttribute('aria-valuetext', s);
+  }
+  const cycle = () => set(SNAPS[(SNAPS.indexOf(snap) + 1) % SNAPS.length]);
+  handle.addEventListener('pointerdown', (e) => {
+    if (!MQ.matches) return;
+    const h0 = aside.getBoundingClientRect().height;
+    drag = { id: e.pointerId, y0: e.clientY, h0, moved: false, v: 0, ly: e.clientY, lt: e.timeStamp,
+             snaps: SNAPS.map((n) => Math.min(px('--sheet-' + n), parseFloat(getComputedStyle(aside).maxHeight) || 1e5)) };
+    handle.setPointerCapture(e.pointerId);
+  });
+  handle.addEventListener('pointermove', (e) => {
+    if (!drag || e.pointerId !== drag.id) return;
+    const dy = drag.y0 - e.clientY;
+    if (!drag.moved && Math.abs(dy) < 6) return;
+    if (!drag.moved) { drag.moved = true; body.classList.add('sheet-dragging'); }
+    const dt = e.timeStamp - drag.lt;
+    if (dt > 0) { drag.v = 0.8 * drag.v + 0.2 * ((drag.ly - e.clientY) / dt); drag.ly = e.clientY; drag.lt = e.timeStamp; }
+    drag.h = Math.max(drag.snaps[0], Math.min(drag.snaps[2], drag.h0 + dy));
+    body.style.setProperty('--sheet-h', drag.h + 'px');
+  });
+  function end(e, cancel) {
+    if (!drag || e.pointerId !== drag.id) return;
+    const d = drag; drag = null;
+    body.classList.remove('sheet-dragging');
+    if (!d.moved) { if (!cancel) cycle(); return; }
+    const want = d.h + d.v * 180;                  // project with fling velocity (px/ms)
+    let best = 0;
+    d.snaps.forEach((h, i) => { if (Math.abs(h - want) < Math.abs(d.snaps[best] - want)) best = i; });
+    set(SNAPS[best]);
+  }
+  handle.addEventListener('pointerup', (e) => end(e, false));
+  handle.addEventListener('pointercancel', (e) => end(e, true));
+  handle.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); cycle(); }
+    else if (e.key === 'ArrowUp') set(SNAPS[Math.min(2, SNAPS.indexOf(snap) + 1)]);
+    else if (e.key === 'ArrowDown') set(SNAPS[Math.max(0, SNAPS.indexOf(snap) - 1)]);
+  });
+  // tabs: opening from peek expands to half; re-tapping the active tab cycles
+  const onTab = (wasActive) => {
+    if (!MQ.matches) return;
+    if (snap === 'peek') set('half'); else if (wasActive) cycle();
+  };
+  // typing needs room: lift a peeking sheet when the chat input is focused
+  $('chatinput').addEventListener('focus', () => { if (MQ.matches && snap === 'peek') set('half'); });
+  MQ.addEventListener('change', () => { set(snap); if (world) world.resize(); });
+  set(snap);
+  return { onTab, set };
+})();
+
+/* ---- viewport tracking: orientation, browser chrome, on-screen keyboard ---- */
+(() => {
+  const root = document.documentElement, vv = window.visualViewport;
+  let raf = 0;
+  function update() {
+    raf = 0;
+    const h = vv ? vv.height : window.innerHeight;
+    const kb = vv ? Math.max(0, window.innerHeight - vv.height - vv.offsetTop) : 0;
+    root.style.setProperty('--vvh', h + 'px');
+    root.style.setProperty('--kb', kb + 'px');
+    document.body.classList.toggle('kb-open', kb > 80);
+    if (world) world.resize();
+  }
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(update); };
+  window.addEventListener('resize', schedule);
+  window.addEventListener('orientationchange', () => { schedule(); setTimeout(schedule, 250); });   // iOS reports stale sizes right after rotate
+  if (vv) { vv.addEventListener('resize', schedule); vv.addEventListener('scroll', schedule); }
+  update();
+})();
+
 document.querySelectorAll('.tabs button').forEach((btn) => {
   btn.addEventListener('click', () => {
+    const wasActive = btn.classList.contains('active');
     document.querySelectorAll('.tabs button').forEach((b) => { b.classList.remove('active'); b.setAttribute('aria-selected', 'false'); });
     document.querySelectorAll('.panel').forEach((p) => p.classList.remove('active'));
     btn.classList.add('active'); btn.setAttribute('aria-selected', 'true');
     $(btn.dataset.panel).classList.add('active');
+    sheet.onTab(wasActive);
   });
 });
 
