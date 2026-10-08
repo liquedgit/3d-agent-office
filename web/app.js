@@ -34,6 +34,14 @@ let firstSnapshot = true;
 let world = null;          // 3D world (null if WebGL unavailable)
 let followId = null;       // agent currently followed by the camera
 
+// localStorage can throw (private mode, disabled storage) — treat it as best-effort
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) { /* ignore */ } },
+};
+let currentProject = store.get('office.project') || 'default';
+let isDay = store.get('office.daynight') === 'day';
+
 const nameOf = (id) => {
   const a = state && (state.agents || []).find((x) => x.id === id || x.name === id);
   return a ? a.name : id;
@@ -70,9 +78,13 @@ function initWorld() {
     $('nogl').hidden = false;
     return null;
   }
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  // perf: fill rate dominates on hi-dpi screens; 1.5x is visually close to 2x at a ~44% lower pixel cost.
+  // Re-clamped in resize() so moving between monitors / browser zoom keeps the budget.
+  const DPR_CAP = 1.5;
+  const pixelRatio = () => Math.min(window.devicePixelRatio || 1, DPR_CAP);
+  renderer.setPixelRatio(pixelRatio());
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = THREE.PCFShadowMap;    // perf: single-tap PCF instead of the soft multi-tap variant
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.05;
@@ -94,12 +106,14 @@ function initWorld() {
   controls.screenSpacePanning = false;
 
   /* ---------------- lighting ---------------- */
-  scene.add(new THREE.AmbientLight(0x8a96b8, 0.35));
-  scene.add(new THREE.HemisphereLight(0x9db8ff, 0x3a2a1c, 0.5));
+  // values below are the night mood; applyMood() cross-fades them toward day
+  const ambient = new THREE.AmbientLight(0x8a96b8, 0.35);
+  const hemi = new THREE.HemisphereLight(0x9db8ff, 0x3a2a1c, 0.5);
+  scene.add(ambient, hemi);
   const key = new THREE.DirectionalLight(0xcfe0ff, 1.15);          // cool "moonlight" through windows
   key.position.set(-16, 26, 14);
   key.castShadow = true;
-  key.shadow.mapSize.set(2048, 2048);
+  key.shadow.mapSize.set(1024, 1024);                               // perf: 4x fewer shadow texels than 2048
   Object.assign(key.shadow.camera, { left: -32, right: 32, top: 24, bottom: -24, near: 1, far: 80 });
   key.shadow.bias = -0.0005;
   key.shadow.normalBias = 0.03;
@@ -138,7 +152,8 @@ function initWorld() {
   floor.receiveShadow = true;
   scene.add(floor);
 
-  const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), new THREE.MeshBasicMaterial({ color: '#06080c' }));
+  const groundMat = new THREE.MeshBasicMaterial({ color: '#06080c' });
+  const ground = new THREE.Mesh(new THREE.PlaneGeometry(400, 400), groundMat);
   ground.rotation.x = -Math.PI / 2; ground.position.y = -0.6;
   scene.add(ground);
 
@@ -177,21 +192,33 @@ function initWorld() {
   crownL.position.set(-FW / 2 + 0.1, WALL_H - 0.1, 0);
   scene.add(baseBack, baseLeft, crown, crownL);
 
-  const skyTex = canvasTex(256, 192, (g, w, h) => {
+  // window view; day and night share one RNG sequence so the skyline is identical in both
+  const skyTex = (day) => canvasTex(256, 192, (g, w, h) => {
     const gr = g.createLinearGradient(0, 0, 0, h);
-    gr.addColorStop(0, '#0d1838'); gr.addColorStop(0.7, '#2a4a80'); gr.addColorStop(1, '#4a6c9c');
+    if (day) { gr.addColorStop(0, '#4f8fd8'); gr.addColorStop(0.7, '#9cc8ef'); gr.addColorStop(1, '#d6e8f6'); }
+    else { gr.addColorStop(0, '#0d1838'); gr.addColorStop(0.7, '#2a4a80'); gr.addColorStop(1, '#4a6c9c'); }
     g.fillStyle = gr; g.fillRect(0, 0, w, h);
     let s = 3; const r = () => (s = (s * 16807) % 2147483647) / 2147483647;
     g.fillStyle = 'rgba(255,255,255,.7)';
-    for (let i = 0; i < 24; i++) g.fillRect(r() * w, r() * h * 0.5, 1.5, 1.5);
+    for (let i = 0; i < 24; i++) { const sx = r() * w, sy = r() * h * 0.5; if (!day) g.fillRect(sx, sy, 1.5, 1.5); }
+    if (day) {
+      const sun = g.createRadialGradient(w * 0.78, h * 0.2, 2, w * 0.78, h * 0.2, 34);
+      sun.addColorStop(0, 'rgba(255,250,220,1)'); sun.addColorStop(0.35, 'rgba(255,240,190,.85)'); sun.addColorStop(1, 'rgba(255,240,190,0)');
+      g.fillStyle = sun; g.fillRect(0, 0, w, h);
+      g.fillStyle = 'rgba(255,255,255,.85)';
+      [[40, 34, 26], [62, 30, 18], [150, 52, 22], [170, 48, 15], [96, 70, 16]].forEach(([cx, cy, cr]) => {
+        g.beginPath(); g.ellipse(cx, cy, cr * 1.6, cr * 0.6, 0, 0, Math.PI * 2); g.fill();
+      });
+    }
     for (let x = 0; x < w; x += 22) {
       const bh = 30 + r() * 60;
-      g.fillStyle = '#0a0f1d'; g.fillRect(x, h - bh, 20, bh);
-      g.fillStyle = '#ffd88a';
+      g.fillStyle = day ? '#6d7d95' : '#0a0f1d'; g.fillRect(x, h - bh, 20, bh);
+      g.fillStyle = day ? '#43526b' : '#ffd88a';
       for (let y = h - bh + 6; y < h - 4; y += 9) for (let xx = x + 3; xx < x + 17; xx += 7) if (r() > 0.55) g.fillRect(xx, y, 3, 4);
     }
   });
-  const paneMat = new THREE.MeshStandardMaterial({ color: '#000', emissive: '#fff', emissiveMap: skyTex, emissiveIntensity: 0.75 });
+  const skyNight = skyTex(false), skyDay = skyTex(true);
+  const paneMat = new THREE.MeshStandardMaterial({ color: '#000', emissive: '#fff', emissiveMap: skyNight, emissiveIntensity: 0.75 });
   const frameMat = new THREE.MeshStandardMaterial({ color: '#10141d', roughness: 0.5, metalness: 0.4 });
   function addWindow(parent, w, h, x, y, z, ry) {
     const g = new THREE.Group();
@@ -224,7 +251,7 @@ function initWorld() {
       const leaf = new THREE.Group();
       leaf.rotation.set(0.25 + (i % 3) * 0.2, (i / 9) * Math.PI * 2, 0, 'YXZ');
       const m = new THREE.Mesh(leafGeo, new THREE.MeshStandardMaterial({ color: new THREE.Color().setHSL(0.33 + (i % 4) * 0.012, 0.5, 0.26 + (i % 3) * 0.04), roughness: 0.8 }));
-      m.castShadow = true; leaf.add(m); holder.add(leaf);
+      leaf.add(m); holder.add(leaf);                 // perf: leaves don't cast shadows (36 fewer shadow draws)
     }
     g.position.set(x, 0, z); g.scale.setScalar(s);
     scene.add(g); swayers.push({ holder, ph: x + z });
@@ -236,7 +263,11 @@ function initWorld() {
 
   const shadeMat = new THREE.MeshStandardMaterial({ color: '#ffe0b0', emissive: '#ffb25c', emissiveIntensity: 1.1, side: THREE.DoubleSide, roughness: 0.6 });
   const lampMetal = new THREE.MeshStandardMaterial({ color: '#2a2f3a', metalness: 0.6, roughness: 0.4 });
-  function addLamp(x, z) {
+  const bulbMat = new THREE.MeshBasicMaterial({ color: '#fff0cc' });
+  const lampLights = [];
+  // perf: every PointLight adds per-fragment work to every lit material, so only `lit` lamps get a real
+  // light (slightly stronger/wider to compensate); the rest are emissive-only.
+  function addLamp(x, z, lit) {
     const g = new THREE.Group();
     const base = new THREE.Mesh(new THREE.CylinderGeometry(0.55, 0.65, 0.12, 14), lampMetal);
     base.position.y = 0.06;
@@ -244,18 +275,21 @@ function initWorld() {
     pole.position.y = 2.2;
     const shade = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.75, 0.9, 14, 1, true), shadeMat);
     shade.position.y = 4.4;
-    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), new THREE.MeshBasicMaterial({ color: '#fff0cc' }));
+    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.22, 10, 8), bulbMat);
     bulb.position.y = 4.35;
-    const light = new THREE.PointLight(0xffc27a, 45, 22, 2);
-    light.position.y = 4.2;
-    g.add(base, pole, shade, bulb, light);
+    g.add(base, pole, shade, bulb);
+    if (lit) {
+      const light = new THREE.PointLight(0xffc27a, 55, 26, 2);
+      light.position.y = 4.2;
+      g.add(light); lampLights.push(light);
+    }
     g.traverse((m) => { if (m.isMesh && m !== bulb) m.castShadow = false; });
     g.position.set(x, 0, z); scene.add(g);
   }
-  addLamp(-20, -3);
-  addLamp(-8.5, -13.5);
-  addLamp(21, 4);
-  addLamp(-20, 8);
+  addLamp(-20, -3, false);
+  addLamp(-8.5, -13.5, true);
+  addLamp(21, 4, true);
+  addLamp(-20, 8, false);
 
   // bookshelf on the left wall
   (function () {
@@ -272,7 +306,8 @@ function initWorld() {
         z += bw + 0.04;
       }
     }
-    g.position.set(-FW / 2 + 0.8, 0, -10.5); g.traverse((m) => { if (m.isMesh) { m.castShadow = true; } });
+    body.castShadow = true;                          // perf: books sit inside the body's shadow anyway
+    g.position.set(-FW / 2 + 0.8, 0, -10.5);
     scene.add(g);
   })();
 
@@ -331,7 +366,9 @@ function initWorld() {
     const ring = new THREE.Mesh(new THREE.RingGeometry(1.0, 1.08, 48), new THREE.MeshBasicMaterial({ color: '#8792a3', transparent: true, opacity: 0.7, side: THREE.DoubleSide }));
     ring.rotation.x = -Math.PI / 2; ring.scale.set(2.0, 1.55, 1); ring.position.set(0, 0.05, 0.9);
     g.add(glow, ring);
-    g.traverse((m) => { if (m.isMesh && m !== glow && m !== ring && m !== screen) { m.castShadow = true; m.receiveShadow = true; } });
+    // perf: keyboard / mouse / mug / monitor stand are too small to need shadows
+    const noShadow = new Set([glow, ring, screen, kb, mouse, mug, stand]);
+    g.traverse((m) => { if (m.isMesh && !noShadow.has(m)) { m.castShadow = true; m.receiveShadow = true; } });
     return { group: g, glow, ring, screenMat: smat, stex, sctx: sc.getContext('2d') };
   }
 
@@ -390,7 +427,7 @@ function initWorld() {
       const band = new THREE.Mesh(new THREE.TorusGeometry(0.34, 0.035, 6, 20, Math.PI), pm); band.position.y = 0.02; head.add(band);
       [-1, 1].forEach((s) => { const cup = new THREE.Mesh(new THREE.CylinderGeometry(0.1, 0.1, 0.1, 10), pm); cup.rotation.z = Math.PI / 2; cup.position.set(0.34 * s, 0.02, 0); head.add(cup); });
     }
-    root.traverse((m) => { if (m.isMesh) m.castShadow = true; });
+    root.traverse((m) => { if (m.isMesh) m.castShadow = m !== badge && m.material !== eyeMat; });
     return { root, body, upper, legs, arms, head, shirt };
   }
 
@@ -459,11 +496,14 @@ function initWorld() {
   pGeo.setAttribute('color', new THREE.BufferAttribute(pCol, 3));
   const points = new THREE.Points(pGeo, new THREE.PointsMaterial({ size: 0.32, vertexColors: true, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
   points.frustumCulled = false;
+  points.visible = false;
   scene.add(points);
   let pCursor = 0;
+  let pActive = false;     // perf: skip the 900-slot loop, buffer uploads and the draw call when nothing is alive
   const tmpC = new THREE.Color();
   function burst(pos, color, n, speed = 4, up = 4, life = 1.2) {
     const colors = Array.isArray(color) ? color : [color];
+    pActive = points.visible = true;
     for (let i = 0; i < n; i++) {
       const k = pCursor = (pCursor + 1) % MAXP;
       const a = Math.random() * Math.PI * 2, sp = speed * (0.3 + Math.random() * 0.7);
@@ -475,10 +515,13 @@ function initWorld() {
     }
   }
   function updateParticles(dt) {
+    if (!pActive) return;
+    let alive = 0;
     for (let k = 0; k < MAXP; k++) {
       if (pLife[k] <= 0) continue;
       pLife[k] -= dt;
       if (pLife[k] <= 0) { pPos[k * 3 + 1] = -1000; continue; }
+      alive++;
       pVel[k * 3 + 1] -= 9 * dt;
       pPos[k * 3] += pVel[k * 3] * dt; pPos[k * 3 + 1] += pVel[k * 3 + 1] * dt; pPos[k * 3 + 2] += pVel[k * 3 + 2] * dt;
       if (pPos[k * 3 + 1] < 0.05) { pPos[k * 3 + 1] = 0.05; pVel[k * 3 + 1] *= -0.3; pVel[k * 3] *= 0.8; pVel[k * 3 + 2] *= 0.8; }
@@ -487,6 +530,7 @@ function initWorld() {
     }
     pGeo.attributes.position.needsUpdate = true;
     pGeo.attributes.color.needsUpdate = true;
+    pActive = points.visible = alive > 0;
   }
 
   /* ---------------- building ---------------- */
@@ -549,6 +593,7 @@ function initWorld() {
   function setBTag(n) {
     if (bTagFloors === n) return;
     bTagFloors = n;
+    if (bTag.material.map) bTag.material.map.dispose();
     bTag.material.map = canvasTex(320, 96, (g, w, h) => {
       g.fillStyle = 'rgba(10,14,20,.86)'; g.beginPath(); g.roundRect(4, 4, w - 8, h - 8, 22); g.fill();
       g.strokeStyle = '#7cb2ff'; g.lineWidth = 3; g.stroke();
@@ -569,7 +614,7 @@ function initWorld() {
       m.position.y = animate ? m.userData.y + 9 : m.userData.y;
       bld.add(m); floorMeshes.push(m);
     }
-    while (builtFloors > n) { bld.remove(floorMeshes.pop()); builtFloors--; }
+    while (builtFloors > n) { const m = floorMeshes.pop(); bld.remove(m); m.geometry.dispose(); builtFloors--; }
     roof.visible = n > 0; site.visible = n === 0;
     setBTag(n);
   }
@@ -593,8 +638,53 @@ function initWorld() {
     roof.position.y = topAnim < 1 ? ty + 20 : roofY + 0.12;
     if (topAnim >= 1) roof.position.y = roofY + 0.12;
     bTag.position.y = (roof.visible ? roofY : 0) + 4.4;
-    beacon.material.color.set(Math.sin(t * 4) > 0 ? '#f87171' : '#5a2020');
+    const on = Math.sin(t * 4) > 0;
+    if (on !== beaconOn) { beaconOn = on; beacon.material.color.set(on ? '#f87171' : '#5a2020'); }
     if (site.visible) { hook.position.y = 5 + Math.sin(t * 1.3) * 0.4; cable.position.y = 7.0 + Math.sin(t * 1.3) * 0.2; }
+  }
+  let beaconOn = true;
+
+  /* ---------------- day / night ---------------- */
+  const C = (c) => new THREE.Color(c);
+  const MOOD = {
+    night: {
+      bg: C('#080b11'), ground: C('#06080c'), amb: C(0x8a96b8), ambI: 0.35, sky: C(0x9db8ff), gnd: C(0x3a2a1c), hemiI: 0.5,
+      key: C(0xcfe0ff), keyI: 1.15, keyPos: new THREE.Vector3(-16, 26, 14), fill: C(0xffd2a0), fillI: 0.4,
+      lamp: 55, shade: 1.1, bulb: C('#fff0cc'), pane: 0.75, facade: 0.35, exposure: 1.05,
+    },
+    day: {
+      bg: C('#8fb8de'), ground: C('#4d5a46'), amb: C(0xfff4e2), ambI: 0.6, sky: C(0xcfe6ff), gnd: C(0x6b5a44), hemiI: 0.8,
+      key: C(0xfff0d8), keyI: 2.1, keyPos: new THREE.Vector3(-10, 30, 18), fill: C(0xcfe2ff), fillI: 0.55,
+      lamp: 0, shade: 0.2, bulb: C('#c9c2b0'), pane: 0.95, facade: 0.06, exposure: 1.0,
+    },
+  };
+  const MOOD_SECS = 1.5;
+  let dayK = isDay ? 1 : 0, dayTarget = dayK;
+  function applyMood(k) {
+    const N = MOOD.night, D = MOOD.day, e = k * k * (3 - 2 * k);
+    scene.background.lerpColors(N.bg, D.bg, e);
+    scene.fog.color.copy(scene.background);
+    groundMat.color.lerpColors(N.ground, D.ground, e);
+    ambient.color.lerpColors(N.amb, D.amb, e); ambient.intensity = lerp(N.ambI, D.ambI, e);
+    hemi.color.lerpColors(N.sky, D.sky, e); hemi.groundColor.lerpColors(N.gnd, D.gnd, e); hemi.intensity = lerp(N.hemiI, D.hemiI, e);
+    key.color.lerpColors(N.key, D.key, e); key.intensity = lerp(N.keyI, D.keyI, e); key.position.lerpVectors(N.keyPos, D.keyPos, e);
+    fill.color.lerpColors(N.fill, D.fill, e); fill.intensity = lerp(N.fillI, D.fillI, e);
+    lampLights.forEach((l) => { l.intensity = lerp(N.lamp, D.lamp, e); });
+    shadeMat.emissiveIntensity = lerp(N.shade, D.shade, e);
+    bulbMat.color.lerpColors(N.bulb, D.bulb, e);
+    faces.forEach((f) => { f.emissiveIntensity = lerp(N.facade, D.facade, e); });
+    // window view: swap the cached sky at the midpoint, dimming the panes around it so the swap reads as a fade
+    paneMat.emissiveMap = e < 0.5 ? skyNight : skyDay;
+    paneMat.emissiveIntensity = lerp(N.pane, D.pane, e) * (0.15 + 0.85 * Math.abs(2 * e - 1));
+    renderer.toneMappingExposure = lerp(N.exposure, D.exposure, e);
+  }
+  applyMood(dayK);
+  function setDay(on) { dayTarget = on ? 1 : 0; }
+  function updateMood(dt) {
+    if (dayK === dayTarget) return;                  // perf: idle unless a transition is running
+    const step = dt / MOOD_SECS;
+    dayK = dayTarget > dayK ? Math.min(dayTarget, dayK + step) : Math.max(dayTarget, dayK - step);
+    applyMood(dayK);
   }
 
   /* ---------------- actors ---------------- */
@@ -659,7 +749,7 @@ function initWorld() {
         layoutActor(A, p, true);
       } else if (!A.desk.equals(p)) layoutActor(A, p, false);
       A.name = a.name; A.task = a.current_task || '';
-      if (a.role !== A.role) { A.role = a.role; attachChar(A); }
+      if (a.role !== A.role) { A.role = a.role; attachChar(A); A.dirty = true; }
       const st = a.status || 'idle';
       if (st !== A.status) {
         A.status = st; A.dirty = true;
@@ -671,13 +761,23 @@ function initWorld() {
       if (!seen.has(id)) {
         scene.remove(A.ch.root, A.d.group, A.tag, A.iconSpr);
         const k = actorRoots.indexOf(A.ch.root); if (k >= 0) actorRoots.splice(k, 1);
+        disposeActor(A);
         actors.delete(id);
         if (followId === id) unfollow();
       }
     }
   }
 
+  // project switches remove a whole team; free its per-actor GPU buffers (shared materials are left alone)
+  function disposeActor(A) {
+    [A.ch.root, A.d.group].forEach((g) => g.traverse((m) => { if (m.geometry) m.geometry.dispose(); }));
+    A.d.stex.dispose();
+    if (A.tag.material.map) A.tag.material.map.dispose();
+    A.tag.material.dispose(); A.iconSpr.material.dispose();
+  }
+
   const FLOOR_X = FW / 2 - 2, FLOOR_Z = FD / 2 - 2;
+  const SCREEN_DT = 0.28;
   const angDiff = (a, b) => { let d = (b - a) % (Math.PI * 2); if (d > Math.PI) d -= Math.PI * 2; if (d < -Math.PI) d += Math.PI * 2; return d; };
 
   function updateActor(A, dt, t) {
@@ -752,18 +852,23 @@ function initWorld() {
     c.body.position.y = P.bodyY;
     c.body.rotation.z = P.swayZ;
     c.root.position.copy(A.pos); c.root.rotation.y = A.yaw;
-    // blocked glow on shirt
-    c.shirt.emissive.set(st === 'blocked' ? '#ff2a2a' : '#000');
-    c.shirt.emissiveIntensity = st === 'blocked' ? 0.25 + 0.2 * Math.sin(t * 4) : 0;
 
-    // desk status visuals
-    const col = STATUS_COLOR[st] || '#8792a3';
-    A.d.glow.material.color.set(col); A.d.ring.material.color.set(col);
+    // status colors only change with the status (perf: no per-frame Color.set string parsing)
     const act = st !== 'idle';
-    A.d.glow.material.opacity = act ? 0.3 + 0.12 * Math.sin(t * 3 + ph) : 0.1;
-    A.d.ring.material.opacity = act ? 0.8 : 0.35;
+    if (A.dirty) {
+      const col = STATUS_COLOR[st] || '#8792a3';
+      A.d.glow.material.color.set(col); A.d.ring.material.color.set(col);
+      A.d.ring.material.opacity = act ? 0.8 : 0.35;
+      if (!act) A.d.glow.material.opacity = 0.1;
+      c.shirt.emissive.set(st === 'blocked' ? '#ff2a2a' : '#000');   // blocked glow on shirt
+      if (st !== 'blocked') c.shirt.emissiveIntensity = 0;
+    }
+    if (st === 'blocked') c.shirt.emissiveIntensity = 0.25 + 0.2 * Math.sin(t * 4);
+    if (act) A.d.glow.material.opacity = 0.3 + 0.12 * Math.sin(t * 3 + ph);
+    // perf: animated screens re-upload their texture ~3.5x/s (was ~8x/s); static ones only on change.
+    // The random back-dating staggers uploads so agents that changed together don't redraw on the same frame.
     const animated = st === 'working' || st === 'thinking' || st === 'testing' || st === 'blocked';
-    if (A.dirty || (animated && t - A.screenT > 0.12)) { drawScreen(A, t); A.screenT = t; }
+    if (A.dirty || (animated && t - A.screenT > SCREEN_DT)) { drawScreen(A, t); A.screenT = t - (A.dirty ? Math.random() * SCREEN_DT : 0); }
 
     // tag + icon
     if (A.tagStatus !== st + '|' + A.name + '|' + A.role) {
@@ -793,17 +898,22 @@ function initWorld() {
     bubblesEl.appendChild(el);
     bubbles.push({ id: agentId, el, until: performance.now() / 1000 + 4.5 });
   }
+  function clearBubbles() { bubbles.splice(0).forEach((b) => b.el.remove()); }
   const tmpV = new THREE.Vector3();
+  let viewW = 1, viewH = 1;                          // cached in resize() (no per-frame layout reads)
   function updateBubbles(now) {
-    const w = host.clientWidth, h = host.clientHeight;
     for (let i = bubbles.length - 1; i >= 0; i--) {
       const b = bubbles[i], A = actors.get(b.id), left = b.until - now;
       if (left <= 0 || !A) { b.el.remove(); bubbles.splice(i, 1); continue; }
       tmpV.set(A.pos.x, 4.7, A.pos.z).project(camera);
-      const vis = tmpV.z < 1 && tmpV.z > -1;
-      b.el.style.display = vis ? '' : 'none';
-      b.el.style.transform = `translate(${((tmpV.x + 1) / 2 * w).toFixed(1)}px, ${((1 - tmpV.y) / 2 * h).toFixed(1)}px) translate(-50%, -100%)`;
-      b.el.style.opacity = String(clamp(left / 0.6, 0, 1));
+      // perf: only touch the DOM when a value actually changed (static camera + idle agent = zero writes)
+      const disp = tmpV.z < 1 && tmpV.z > -1 ? '' : 'none';
+      if (b.disp !== disp) { b.disp = disp; b.el.style.display = disp; }
+      if (disp) continue;
+      const tf = `translate(${((tmpV.x + 1) / 2 * viewW).toFixed(1)}px, ${((1 - tmpV.y) / 2 * viewH).toFixed(1)}px) translate(-50%, -100%)`;
+      if (b.tf !== tf) { b.tf = tf; b.el.style.transform = tf; }
+      const op = clamp(left / 0.6, 0, 1).toFixed(2);
+      if (b.op !== op) { b.op = op; b.el.style.opacity = op; }
     }
   }
 
@@ -868,6 +978,7 @@ function initWorld() {
   let down = null;
   const dom = renderer.domElement;
   dom.addEventListener('pointerdown', (e) => { down = { x: e.clientX, y: e.clientY }; });
+  dom.addEventListener('pointercancel', () => { down = null; });
   dom.addEventListener('pointerup', (e) => {
     if (!down) return;
     const moved = Math.hypot(e.clientX - down.x, e.clientY - down.y); down = null;
@@ -877,7 +988,7 @@ function initWorld() {
   });
   let lastHover = 0;
   dom.addEventListener('pointermove', (e) => {
-    const n = performance.now(); if (n - lastHover < 60 || e.buttons) return; lastHover = n;
+    const n = performance.now(); if (n - lastHover < 60 || e.buttons || down) return; lastHover = n;   // no raycasts mid-drag
     dom.style.cursor = pickActor(e) ? 'pointer' : 'grab';
   });
 
@@ -885,6 +996,8 @@ function initWorld() {
   const asideEl = document.querySelector('aside');
   function resize() {
     const w = host.clientWidth || window.innerWidth, h = host.clientHeight || window.innerHeight;
+    viewW = w; viewH = h;
+    renderer.setPixelRatio(pixelRatio());
     renderer.setSize(w, h);
     camera.aspect = w / h;
     const open = !document.body.classList.contains('aside-closed') && w > 900;
@@ -911,14 +1024,22 @@ function initWorld() {
     swayers.forEach((s) => { s.holder.rotation.z = Math.sin(t * 0.9 + s.ph) * 0.03; s.holder.rotation.x = Math.cos(t * 0.7 + s.ph) * 0.02; });
     updateBuilding(dt, t);
     updateParticles(dt);
+    updateMood(dt);
     updateCamera(dt);
     updateBubbles(performance.now() / 1000);
     renderer.render(scene, camera);
   }
   requestAnimationFrame(frame);
 
+  // switching project rooms: drop the old team, its bubbles and its building
+  function reset() {
+    syncActors([]);
+    clearBubbles();
+    setFloors(0, false);
+  }
+
   return {
-    sync: syncActors, say, burst, setFloors, follow, unfollow, resetView, resize,
+    sync: syncActors, say, burst, setFloors, follow, unfollow, resetView, resize, setDay, reset,
     actorPos: (id) => { const A = actors.get(id); return A ? A.pos : null; },
     has: (id) => actors.has(id),
   };
@@ -1103,20 +1224,99 @@ function updateRoster(agents) {
 /* ------------------------------------------------------------------ */
 /* WebSocket                                                          */
 /* ------------------------------------------------------------------ */
+let sock = null, reconnectTimer = 0;
 function connect() {
+  clearTimeout(reconnectTimer);
+  if (sock) { const old = sock; sock = null; old.close(); }   // its onclose sees ws !== sock and stays quiet
   const statusEl = $('status'), dot = $('dot');
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(proto + '://' + location.host + '/ws');
-  ws.onopen = () => { statusEl.textContent = 'Live'; dot.classList.add('live'); };
+  const ws = sock = new WebSocket(proto + '://' + location.host + '/ws?project=' + encodeURIComponent(currentProject));
+  ws.onopen = () => { if (ws !== sock) return; statusEl.textContent = 'Live'; dot.classList.add('live'); };
   ws.onmessage = (ev) => {
+    if (ws !== sock) return;                          // late message from a room we already left
     let msg; try { msg = JSON.parse(ev.data); } catch (e) { return; }
-    if (msg.type === 'snapshot') ingest(msg.data);
+    if (msg.type === 'snapshot') {
+      // the server falls back to 'default' for unknown ids (e.g. a stale localStorage value) — follow it
+      if (msg.project && msg.project !== currentProject) adoptProject(msg.project);
+      ingest(msg.data);
+    } else if (msg.type === 'projects') renderProjects(msg.data);
   };
   ws.onclose = () => {
+    if (ws !== sock) return;                          // replaced by a project switch
     statusEl.textContent = 'Reconnecting…'; dot.classList.remove('live');
-    setTimeout(connect, 1500);
+    reconnectTimer = setTimeout(connect, 1500);
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Projects (rooms)                                                   */
+/* ------------------------------------------------------------------ */
+const projectSel = $('projectselect');
+let projects = [];
+
+function renderProjects(list) {
+  if (Array.isArray(list)) projects = list;
+  const shown = projects.some((p) => p.id === currentProject) ? projects : projects.concat([{ id: currentProject, name: currentProject }]);
+  projectSel.innerHTML = '';
+  shown.forEach((p) => {
+    const o = document.createElement('option');
+    o.value = p.id; o.textContent = p.name || p.id;
+    projectSel.appendChild(o);
+  });
+  projectSel.value = currentProject;
+}
+
+function loadProjects() {
+  return fetch('/api/projects').then((r) => (r.ok ? r.json() : null)).then((list) => { if (list) renderProjects(list); }).catch(() => {});
+}
+
+function adoptProject(pid) {
+  currentProject = pid;
+  store.set('office.project', pid);
+  renderProjects();
+}
+
+function switchProject(pid) {
+  if (!pid || pid === currentProject) return;
+  adoptProject(pid);
+  // forget the old room so its history isn't diffed against (or replayed into) the new one
+  state = null; lastEventId = 0; firstSnapshot = true;
+  for (const k in sigs) delete sigs[k];
+  if (world) world.reset();
+  updateSidebar({});
+  $('status').textContent = 'Connecting…'; $('dot').classList.remove('live');
+  connect();
+}
+
+projectSel.addEventListener('change', () => switchProject(projectSel.value));
+$('newproject').addEventListener('click', () => {
+  const name = (window.prompt('New project name (e.g. "CRM app")') || '').trim();
+  if (!name) return;
+  fetch('/api/projects', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  }).then((r) => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+    .then((res) => { switchProject(res.id); loadProjects(); })
+    .catch((err) => { console.error('create project failed', err); window.alert('Could not create the project.'); });
+});
+
+/* ------------------------------------------------------------------ */
+/* Day / night                                                        */
+/* ------------------------------------------------------------------ */
+const dayBtn = $('daynight');
+function renderDayBtn() {
+  dayBtn.querySelector('.dn-ic').textContent = isDay ? '☀️' : '🌙';
+  dayBtn.querySelector('.dn-lbl').textContent = isDay ? 'Day' : 'Night';
+  dayBtn.title = isDay ? 'Switch to night' : 'Switch to day';
+  dayBtn.setAttribute('aria-pressed', String(isDay));
+}
+dayBtn.addEventListener('click', () => {
+  isDay = !isDay;
+  store.set('office.daynight', isDay ? 'day' : 'night');
+  renderDayBtn();
+  if (world) world.setDay(isDay);
+});
 
 /* ------------------------------------------------------------------ */
 /* Chat + tabs + chrome                                               */
@@ -1129,7 +1329,7 @@ function sendChat() {
   fetch('/api/message', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ speaker: 'user', message: text }),
+    body: JSON.stringify({ speaker: 'user', message: text, project: currentProject }),
   }).then(() => { chatInput.value = ''; }).catch(() => {}).finally(() => { chatSend.disabled = false; chatInput.focus(); });
 }
 chatSend.addEventListener('click', sendChat);
@@ -1160,4 +1360,7 @@ try {
   $('nogl').hidden = false;
   world = null;
 }
+renderDayBtn();
+renderProjects();
+loadProjects();
 connect();
