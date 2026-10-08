@@ -74,13 +74,13 @@ def seed_defaults():
     if get_agents():
         return False
     AGENTS = [
-        ("ceo",  "ceo",  "Ada (CEO)",   0.50, 0.20),
-        ("eng1", "engineer", "Milo",    0.20, 0.45),
-        ("eng2", "engineer", "Zara",    0.35, 0.45),
-        ("eng3", "engineer", "Kai",     0.20, 0.70),
-        ("eng4", "engineer", "Nova",    0.35, 0.70),
-        ("qa1",  "qa",   "Iris (QA)",   0.72, 0.50),
-        ("qa2",  "qa",   "Rex (QA)",    0.72, 0.72),
+        ("ceo",  "ceo",  "Suwandi",     0.50, 0.20),
+        ("eng1", "engineer", "Michael", 0.20, 0.45),
+        ("eng2", "engineer", "Tubagus", 0.35, 0.45),
+        ("eng3", "engineer", "Prasetya", 0.20, 0.70),
+        ("eng4", "engineer", "Wahyudi", 0.35, 0.70),
+        ("qa1",  "qa",   "Richfal",     0.72, 0.50),
+        ("qa2",  "qa",   "Shulkhan",    0.72, 0.72),
     ]
     for agent_id, role, name, x, y in AGENTS:
         upsert_agent(agent_id, role, name, x, y, status="idle")
