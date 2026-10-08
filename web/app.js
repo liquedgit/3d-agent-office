@@ -18,8 +18,9 @@ const STATUS_COLOR = {
   idle: '#8792a3', thinking: '#fbbf24', working: '#4f9cf9', testing: '#a78bfa',
   blocked: '#f87171', waiting: '#fbbf24', done: '#34d399',
 };
+// status markers are drawn as vector glyphs (see getStatusTex); keys only name the shape
 const STATUS_ICON = {
-  idle: '💤', thinking: '💭', working: '💻', testing: '🧪', blocked: '⚠️', waiting: '⏳', done: '✅',
+  idle: 'idle', thinking: 'thinking', working: 'working', testing: 'testing', blocked: 'blocked', waiting: 'waiting', done: 'done',
 };
 const ROLE_COLOR = { ceo: '#fbbf24', engineer: '#4f9cf9', qa: '#a78bfa' };
 const ROLE_LABEL = { ceo: 'CEO', engineer: 'Engineer', qa: 'QA' };
@@ -193,33 +194,72 @@ function initWorld() {
   crownL.position.set(-FW / 2 + 0.1, WALL_H - 0.1, 0);
   scene.add(baseBack, baseLeft, crown, crownL);
 
-  // window view; day and night share one RNG sequence so the skyline is identical in both
-  const skyTex = (day) => canvasTex(256, 192, (g, w, h) => {
-    const gr = g.createLinearGradient(0, 0, 0, h);
-    if (day) { gr.addColorStop(0, '#4f8fd8'); gr.addColorStop(0.7, '#9cc8ef'); gr.addColorStop(1, '#d6e8f6'); }
-    else { gr.addColorStop(0, '#0d1838'); gr.addColorStop(0.7, '#2a4a80'); gr.addColorStop(1, '#4a6c9c'); }
-    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+  // window view: one live canvas, re-drawn ~15fps. Day and night share one RNG sequence so the skyline
+  // is identical in both; `k` (0 night .. 1 day) lerps every palette so the toggle crossfades.
+  const skyCv = document.createElement('canvas'); skyCv.width = 256; skyCv.height = 192;
+  const skyG = skyCv.getContext('2d');
+  const skyTexture = new THREE.CanvasTexture(skyCv); skyTexture.colorSpace = THREE.SRGBColorSpace;
+  const hexRgb = (h) => [parseInt(h.slice(1, 3), 16), parseInt(h.slice(3, 5), 16), parseInt(h.slice(5, 7), 16)];
+  const mixHex = (n, d, k) => { const a = hexRgb(n), b = hexRgb(d); return 'rgb(' + a.map((v, i) => Math.round(v + (b[i] - v) * k)).join(',') + ')'; };
+  const skyStars = [], skyBlds = [];
+  {
     let s = 3; const r = () => (s = (s * 16807) % 2147483647) / 2147483647;
-    g.fillStyle = 'rgba(255,255,255,.7)';
-    for (let i = 0; i < 24; i++) { const sx = r() * w, sy = r() * h * 0.5; if (!day) g.fillRect(sx, sy, 1.5, 1.5); }
-    if (day) {
-      const sun = g.createRadialGradient(w * 0.78, h * 0.2, 2, w * 0.78, h * 0.2, 34);
-      sun.addColorStop(0, 'rgba(255,250,220,1)'); sun.addColorStop(0.35, 'rgba(255,240,190,.85)'); sun.addColorStop(1, 'rgba(255,240,190,0)');
-      g.fillStyle = sun; g.fillRect(0, 0, w, h);
-      g.fillStyle = 'rgba(255,255,255,.85)';
-      [[40, 34, 26], [62, 30, 18], [150, 52, 22], [170, 48, 15], [96, 70, 16]].forEach(([cx, cy, cr]) => {
-        g.beginPath(); g.ellipse(cx, cy, cr * 1.6, cr * 0.6, 0, 0, Math.PI * 2); g.fill();
+    for (let i = 0; i < 24; i++) skyStars.push({ x: r() * 256, y: r() * 192 * 0.5, ph: r() * 6.28 + i });
+    for (let x = 0; x < 256; x += 22) {
+      const bh = 30 + r() * 60, wins = [];
+      for (let y = 192 - bh + 6; y < 192 - 4; y += 9) for (let xx = x + 3; xx < x + 17; xx += 7) if (r() > 0.55) wins.push({ x: xx, y, f: (xx * 7 + y * 13) % 5 === 0, ph: (xx * 31 + y * 17) % 97 });
+      skyBlds.push({ x, bh, wins });
+    }
+  }
+  const skyClouds = [[40, 34, 26, 5], [62, 30, 18, 7], [150, 52, 22, 4], [170, 48, 15, 6], [96, 70, 16, 8]];
+  let skyK = 0, skyDirty = true, skyLast = -1;
+  function drawSky(t, k) {
+    const g = skyG, w = 256, h = 192, day = 1 - k;
+    const gr = g.createLinearGradient(0, 0, 0, h);
+    gr.addColorStop(0, mixHex('#0d1838', '#4f8fd8', k)); gr.addColorStop(0.7, mixHex('#2a4a80', '#9cc8ef', k)); gr.addColorStop(1, mixHex('#4a6c9c', '#d6e8f6', k));
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    if (day > 0.01) {                                // stars + moon fade out as the day comes in
+      g.fillStyle = '#fff';
+      skyStars.forEach((st) => { g.globalAlpha = day * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 1.6 + st.ph))); g.fillRect(st.x, st.y, 1.5, 1.5); });
+      const mh = g.createRadialGradient(w * 0.22, h * 0.2, 3, w * 0.22, h * 0.2, 30);
+      mh.addColorStop(0, 'rgba(235,240,255,.55)'); mh.addColorStop(1, 'rgba(235,240,255,0)');
+      g.globalAlpha = day; g.fillStyle = mh; g.fillRect(0, 0, w, h);
+      g.fillStyle = '#eef2ff'; g.beginPath(); g.arc(w * 0.22, h * 0.2, 6, 0, Math.PI * 2); g.fill();
+      g.globalAlpha = 1;
+    }
+    if (k > 0.01) {                                  // sun with slow pulse
+      const pu = 1 + 0.08 * Math.sin(t * 0.9), sx = w * 0.78, sy = h * 0.2;
+      const sun = g.createRadialGradient(sx, sy, 2, sx, sy, 34 * pu);
+      sun.addColorStop(0, 'rgba(255,250,220,1)'); sun.addColorStop(0.35, 'rgba(255,240,190,' + (0.8 + 0.1 * Math.sin(t * 0.9)).toFixed(3) + ')'); sun.addColorStop(1, 'rgba(255,240,190,0)');
+      g.globalAlpha = k; g.fillStyle = sun; g.fillRect(0, 0, w, h); g.globalAlpha = 1;
+    }
+    // drifting soft clouds: bright by day, faint dusky wisps at night
+    g.save(); g.filter = 'blur(2px)';
+    skyClouds.forEach(([cx, cy, cr, sp], i) => {
+      const x = ((cx + t * sp * 0.6) % (w + 80)) - 40, ry = cr * 0.6;
+      g.fillStyle = mixHex('#6a7fa8', '#ffffff', k); g.globalAlpha = 0.18 + 0.67 * k;
+      if (k < 0.01 && i > 2) return;
+      g.beginPath(); g.ellipse(x, cy, cr * 1.6, ry, 0, 0, Math.PI * 2); g.fill();
+      g.globalAlpha *= 0.35; g.fillStyle = mixHex('#2a3550', '#8aa0bd', k);   // soft shifting underside shadow
+      g.beginPath(); g.ellipse(x + 3 + Math.sin(t * 0.3 + i) * 2, cy + ry * 0.6, cr * 1.3, ry * 0.45, 0, 0, Math.PI * 2); g.fill();
+    });
+    g.restore(); g.globalAlpha = 1;
+    skyBlds.forEach((b) => {
+      g.fillStyle = mixHex('#0a0f1d', '#6d7d95', k); g.fillRect(b.x, h - b.bh, 20, b.bh);
+      const lit = mixHex('#ffd88a', '#43526b', k);
+      g.fillStyle = lit;
+      b.wins.forEach((wn) => {
+        if (wn.f && Math.sin(t * 0.35 + wn.ph) < -0.3) return;   // a few windows flick off/on
+        g.fillRect(wn.x, wn.y, 3, 4);
       });
-    }
-    for (let x = 0; x < w; x += 22) {
-      const bh = 30 + r() * 60;
-      g.fillStyle = day ? '#6d7d95' : '#0a0f1d'; g.fillRect(x, h - bh, 20, bh);
-      g.fillStyle = day ? '#43526b' : '#ffd88a';
-      for (let y = h - bh + 6; y < h - 4; y += 9) for (let xx = x + 3; xx < x + 17; xx += 7) if (r() > 0.55) g.fillRect(xx, y, 3, 4);
-    }
-  });
-  const skyNight = skyTex(false), skyDay = skyTex(true);
-  const paneMat = new THREE.MeshStandardMaterial({ color: '#000', emissive: '#fff', emissiveMap: skyNight, emissiveIntensity: 0.75 });
+    });
+  }
+  function updateSky(t, force) {
+    if (!force && !skyDirty && t - skyLast < 1 / 15) return;
+    skyLast = t; skyDirty = false;
+    drawSky(t, skyK); skyTexture.needsUpdate = true;
+  }
+  const paneMat = new THREE.MeshStandardMaterial({ color: '#000', emissive: '#fff', emissiveMap: skyTexture, emissiveIntensity: 0.75 });
   const frameMat = new THREE.MeshStandardMaterial({ color: '#10141d', roughness: 0.5, metalness: 0.4 });
   function addWindow(parent, w, h, x, y, z, ry) {
     const g = new THREE.Group();
@@ -322,16 +362,28 @@ function initWorld() {
     gr.addColorStop(0, 'rgba(255,255,255,1)'); gr.addColorStop(0.5, 'rgba(255,255,255,.35)'); gr.addColorStop(1, 'rgba(255,255,255,0)');
     g.fillStyle = gr; g.fillRect(0, 0, w, h);
   });
-  const emojiTex = new Map();
-  function getEmojiTex(e) {
-    if (!emojiTex.has(e)) {
-      emojiTex.set(e, canvasTex(128, 128, (g, w, h) => {
-        g.font = '92px "Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif';
-        g.textAlign = 'center'; g.textBaseline = 'middle';
-        g.fillText(e, w / 2, h / 2 + 6);
+  const statusTex = new Map();
+  function getStatusTex(kind) {
+    if (!statusTex.has(kind)) {
+      statusTex.set(kind, canvasTex(128, 128, (g, w, h) => {
+        const col = STATUS_COLOR[kind] || '#8792a3', cx = w / 2, cy = h / 2;
+        g.fillStyle = 'rgba(10,14,20,.88)';
+        g.beginPath(); g.arc(cx, cy, 46, 0, Math.PI * 2); g.fill();
+        g.strokeStyle = col; g.fillStyle = col; g.lineWidth = 6; g.lineCap = 'round'; g.lineJoin = 'round';
+        g.beginPath(); g.arc(cx, cy, 46, 0, Math.PI * 2); g.stroke();
+        g.lineWidth = 8;
+        g.beginPath();
+        if (kind === 'done') { g.moveTo(cx - 20, cy + 2); g.lineTo(cx - 6, cy + 16); g.lineTo(cx + 22, cy - 14); g.stroke(); }
+        else if (kind === 'blocked') { g.moveTo(cx, cy - 22); g.lineTo(cx, cy + 4); g.stroke(); g.beginPath(); g.arc(cx, cy + 20, 4.5, 0, Math.PI * 2); g.fill(); }
+        else if (kind === 'working') { g.moveTo(cx - 12, cy - 18); g.lineTo(cx - 26, cy); g.lineTo(cx - 12, cy + 18); g.moveTo(cx + 12, cy - 18); g.lineTo(cx + 26, cy); g.lineTo(cx + 12, cy + 18); g.stroke(); }
+        else if (kind === 'testing') { g.moveTo(cx - 10, cy - 24); g.lineTo(cx - 10, cy - 6); g.lineTo(cx - 24, cy + 20); g.lineTo(cx + 24, cy + 20); g.lineTo(cx + 10, cy - 6); g.lineTo(cx + 10, cy - 24); g.stroke(); }
+        else if (kind === 'thinking') { g.arc(cx - 22, cy, 4.5, 0, Math.PI * 2); g.moveTo(cx + 4.5, cy); g.arc(cx, cy, 4.5, 0, Math.PI * 2); g.moveTo(cx + 26.5, cy); g.arc(cx + 22, cy, 4.5, 0, Math.PI * 2); g.fill(); }
+        else if (kind === 'waiting') { g.moveTo(cx - 16, cy - 22); g.lineTo(cx + 16, cy - 22); g.lineTo(cx - 16, cy + 22); g.lineTo(cx + 16, cy + 22); g.closePath(); g.stroke(); }
+        else if (kind === 'moving') { g.moveTo(cx - 8, cy - 22); g.lineTo(cx + 14, cy); g.lineTo(cx - 8, cy + 22); g.stroke(); }
+        else { g.moveTo(cx - 20, cy); g.lineTo(cx + 20, cy); g.stroke(); }   // idle
       }));
     }
-    return emojiTex.get(e);
+    return statusTex.get(kind);
   }
 
   function buildDesk() {
@@ -441,7 +493,7 @@ function initWorld() {
       g.textAlign = 'center'; g.fillStyle = '#eef2f8'; g.font = '600 32px system-ui, sans-serif';
       g.fillText(A.name || A.id, w / 2, 42, w - 36);
       g.fillStyle = col; g.font = '500 22px system-ui, sans-serif';
-      g.fillText('● ' + A.status + (A.role ? '  ·  ' + (ROLE_LABEL[A.role] || A.role) : ''), w / 2, 72, w - 36);
+      g.fillText(A.status + (A.role ? '  ·  ' + (ROLE_LABEL[A.role] || A.role) : ''), w / 2, 72, w - 36);
     });
     return tex;
   }
@@ -477,8 +529,8 @@ function initWorld() {
       g.fillText('!', W / 2, H / 2 + 3);
       intensity = Math.sin(t * 5) > 0 ? 1 : 0.35;
     } else if (st === 'done') {
-      g.fillStyle = '#34d399'; g.font = 'bold 54px sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
-      g.fillText('✓', W / 2, H / 2 + 3);
+      g.strokeStyle = '#34d399'; g.lineWidth = 7; g.lineCap = 'round'; g.lineJoin = 'round';
+      g.beginPath(); g.moveTo(W / 2 - 18, H / 2 + 2); g.lineTo(W / 2 - 6, H / 2 + 15); g.lineTo(W / 2 + 19, H / 2 - 14); g.stroke();
       intensity = 0.85;
     } else {                                         // idle / waiting: screen off
       g.fillStyle = '#0a111b'; g.fillRect(0, 0, W, H);
@@ -579,7 +631,8 @@ function initWorld() {
   const signTex = canvasTex(256, 96, (g, w, h) => {
     g.fillStyle = '#f5b301'; g.fillRect(0, 0, w, h);
     g.fillStyle = '#111'; g.font = 'bold 34px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
-    g.fillText('🏗 BUILD SITE', w / 2, h / 2 + 2);
+    g.strokeStyle = '#111'; g.lineWidth = 4; g.strokeRect(8, 8, w - 16, h - 16);
+    g.fillText('BUILD SITE', w / 2, h / 2 + 2);
   });
   const sign = new THREE.Mesh(new THREE.PlaneGeometry(2.6, 0.97), new THREE.MeshStandardMaterial({ map: signTex, roughness: 0.6 }));
   sign.position.set(-2.4, 1.2, 3.65); site.add(sign);
@@ -599,7 +652,7 @@ function initWorld() {
       g.fillStyle = 'rgba(10,14,20,.86)'; g.beginPath(); g.roundRect(4, 4, w - 8, h - 8, 22); g.fill();
       g.strokeStyle = '#7cb2ff'; g.lineWidth = 3; g.stroke();
       g.fillStyle = '#eef2f8'; g.font = '600 34px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
-      g.fillText('🏢 ' + n + (n === 1 ? ' floor' : ' floors'), w / 2, h / 2 + 2);
+      g.fillText(n + (n === 1 ? ' floor' : ' floors'), w / 2, h / 2 + 2);
     });
     bTag.material.needsUpdate = true;
   }
@@ -674,9 +727,9 @@ function initWorld() {
     shadeMat.emissiveIntensity = lerp(N.shade, D.shade, e);
     bulbMat.color.lerpColors(N.bulb, D.bulb, e);
     faces.forEach((f) => { f.emissiveIntensity = lerp(N.facade, D.facade, e); });
-    // window view: swap the cached sky at the midpoint, dimming the panes around it so the swap reads as a fade
-    paneMat.emissiveMap = e < 0.5 ? skyNight : skyDay;
-    paneMat.emissiveIntensity = lerp(N.pane, D.pane, e) * (0.15 + 0.85 * Math.abs(2 * e - 1));
+    // window view: the live sky canvas crossfades its own palette with the same eased value
+    skyK = e; skyDirty = true;
+    paneMat.emissiveIntensity = lerp(N.pane, D.pane, e);
     renderer.toneMappingExposure = lerp(N.exposure, D.exposure, e);
   }
   applyMood(dayK);
@@ -877,8 +930,8 @@ function initWorld() {
       if (A.tag.material.map) A.tag.material.map.dispose();
       A.tag.material.map = nameTag(A); A.tag.material.needsUpdate = true;
     }
-    const ic = A.moving ? '🚶' : STATUS_ICON[st] || '🙂';
-    if (A.icon !== ic) { A.icon = ic; A.iconSpr.material.map = getEmojiTex(ic); A.iconSpr.material.needsUpdate = true; }
+    const ic = A.moving ? 'moving' : STATUS_ICON[st] || 'idle';
+    if (A.icon !== ic) { A.icon = ic; A.iconSpr.material.map = getStatusTex(ic); A.iconSpr.material.needsUpdate = true; }
     const hy = 2.95 - (sit > 0.5 ? 0.18 : 0);
     A.tag.position.set(A.pos.x, hy + 0.95, A.pos.z);
     A.iconSpr.position.set(A.pos.x, hy + 0.1 + Math.sin(t * 3 + ph) * 0.08, A.pos.z);
@@ -1031,6 +1084,7 @@ function initWorld() {
     updateBuilding(dt, t);
     updateParticles(dt);
     updateMood(dt);
+    updateSky(t);
     updateCamera(dt);
     updateBubbles(performance.now() / 1000);
     renderer.render(scene, camera);
@@ -1195,15 +1249,23 @@ function updateTasks(tasks, agents) {
 }
 
 const metricsEl = $('metrics');
+const mSvg = (d) => '<svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">' + d + '</svg>';
+const METRIC_ICON = {
+  floors: mSvg('<rect x="5" y="3" width="14" height="18" rx="1.5"/><path d="M9 8h2M13 8h2M9 12h2M13 12h2M10 21v-4h4v4"/>'),
+  commits: mSvg('<circle cx="12" cy="12" r="3.5"/><path d="M3 12h5.5M15.5 12H21"/>'),
+  passed: mSvg('<circle cx="12" cy="12" r="9"/><path d="M8 12.5l2.7 2.7L16 9.5"/>'),
+  failed: mSvg('<circle cx="12" cy="12" r="9"/><path d="M9 9l6 6M15 9l-6 6"/>'),
+  done: mSvg('<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8.5 12.5l2.5 2.5 4.5-5"/>'),
+};
 function updateMetrics(m) {
   if (!changed('metrics', m)) return;
   const pass = m.tests_passed || 0, fail = m.tests_failed || 0, total = pass + fail;
   const items = [
-    ['🏢', 'Floors', m.floors || 0, '#7cb2ff'],
-    ['📦', 'Commits', m.commits || 0, '#a78bfa'],
-    ['✅', 'Tests passed', pass, '#34d399'],
-    ['❌', 'Tests failed', fail, '#f87171'],
-    ['✔️', 'Tasks done', m.tasks_done || 0, '#fbbf24'],
+    [METRIC_ICON.floors, 'Floors', m.floors || 0, '#7cb2ff'],
+    [METRIC_ICON.commits, 'Commits', m.commits || 0, '#a78bfa'],
+    [METRIC_ICON.passed, 'Tests passed', pass, '#34d399'],
+    [METRIC_ICON.failed, 'Tests failed', fail, '#f87171'],
+    [METRIC_ICON.done, 'Tasks done', m.tasks_done || 0, '#fbbf24'],
   ];
   metricsEl.innerHTML = items.map(([ic, l, v, c]) =>
     '<div class="metric" style="--c:' + c + '"><span class="mi">' + ic + '</span><b>' + v + '</b><span class="ml">' + l + '</span></div>').join('') +
@@ -1312,7 +1374,7 @@ $('newproject').addEventListener('click', () => {
 /* ------------------------------------------------------------------ */
 const dayBtn = $('daynight');
 function renderDayBtn() {
-  dayBtn.querySelector('.dn-ic').textContent = isDay ? '☀️' : '🌙';
+  dayBtn.classList.toggle('is-day', isDay);
   dayBtn.querySelector('.dn-lbl').textContent = isDay ? 'Day' : 'Night';
   dayBtn.title = isDay ? 'Switch to night' : 'Switch to day';
   dayBtn.setAttribute('aria-pressed', String(isDay));
