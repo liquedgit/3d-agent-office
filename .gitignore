@@ -8,3 +8,4 @@ __pycache__/
 .git/
 workspace/
 pending_discord.jsonl
+.orchestrator.lock
