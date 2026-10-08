@@ -1,0 +1,10 @@
+.venv/
+office.db
+office.db-wal
+office.db-shm
+data/
+__pycache__/
+*.pyc
+.git/
+workspace/
+pending_discord.jsonl

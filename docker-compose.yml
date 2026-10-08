@@ -1,0 +1,12 @@
+services:
+  office:
+    build: .
+    container_name: agent-office
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8765:8765"
+    environment:
+      - OFFICE_DB=/app/data/office.db
+    volumes:
+      - ./data:/app/data      # persistent DB
+      - ./web:/app/web        # frontend (edit on host, live in container)

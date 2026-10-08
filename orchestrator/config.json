@@ -1,0 +1,21 @@
+{
+  "base_url": "http://127.0.0.1:8765",
+  "poll_interval_sec": 3,
+  "workspace": "~/agent-office/workspace",
+  "pending_discord_file": "~/agent-office/pending_discord.jsonl",
+  "claude_bin": "claude",
+  "max_budget_usd": 2.00,
+  "max_turns": 15,
+  "run_timeout_sec": 900,
+  "engineer_ids": ["eng1", "eng2", "eng3", "eng4"],
+  "qa_ids": ["qa1", "qa2"],
+  "tiers": {
+    "ceo_chat":      {"model": "sonnet", "effort": "medium"},
+    "ceo_plan":      {"model": "opus",   "effort": "high"},
+    "eng_standard":  {"model": "sonnet", "effort": "medium"},
+    "eng_trivial":   {"model": "haiku",  "effort": "low"},
+    "qa_tests":      {"model": "haiku",  "effort": "low"},
+    "qa_review":     {"model": "sonnet", "effort": "medium"},
+    "mechanical":    {"model": "haiku",  "effort": "low"}
+  }
+}
