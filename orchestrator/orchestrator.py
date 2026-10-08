@@ -15,6 +15,7 @@ import concurrent.futures as cf
 import fcntl
 import json
 import os
+import random
 import re
 import signal
 import subprocess
@@ -48,6 +49,32 @@ GIT_IDENTITY = ("-c", "user.name=Michael Bryan Chandra",
                 "-c", "user.email=89082382+liquedgit@users.noreply.github.com")
 
 
+# Transient-limit retry tuning; every key is optional in config.json.
+LIMIT_RETRY_DEFAULTS = {
+    "limit_retries": 5,            # max retry attempts
+    "limit_retry_base_sec": 20,    # first backoff
+    "limit_retry_max_sec": 300,    # cap per backoff
+    "limit_retry_total_sec": 1800, # hard cap on total wait across retries
+}
+RETRYABLE_SUBTYPES = {"rate_limit", "billing_error", "error_max_turns", "error_budget"}
+LIMIT_RE = re.compile(
+    r"rate.?limit|usage limit|too many requests|\b429\b|overloaded|subscription|"
+    r"weekly limit|daily limit|monthly limit|billing|plan limit|quota|max.*turns|budget exceeded",
+    re.I)
+
+
+def is_retryable_limit(data, err, out):
+    """True for transient 'try again later' limit failures, False for real failures."""
+    if isinstance(data, dict):
+        if data.get("subtype") in RETRYABLE_SUBTYPES:
+            return True
+        # Parsed JSON: don't scan the model's own result text, it may quote anything.
+        text = f"{err or ''} {data.get('error') or ''}"
+    else:
+        text = f"{err or ''} {out or ''}"
+    return bool(LIMIT_RE.search(text))
+
+
 def log(msg):
     ts = datetime.now().strftime("%H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
@@ -75,6 +102,8 @@ def load_config(path):
         raise SystemExit(f"config: max_turns must be 1..{MAX_TURNS_CEILING}")
     if float(cfg["max_budget_usd"]) <= 0:
         raise SystemExit("config: max_budget_usd must be > 0")
+    for key, default in LIMIT_RETRY_DEFAULTS.items():
+        cfg[key] = type(default)(cfg.get(key, default))
     return cfg
 
 
@@ -159,8 +188,31 @@ class Claude:
         ]
 
     def run(self, tier_name, prompt, cwd, tools=FULL_TOOLS):
-        """Returns (ok, result_text, info). Prompt goes over stdin so it can't be
-        swallowed by the variadic --allowedTools flag or hit argv size limits."""
+        """Returns (ok, result_text, info). Transient limit failures are retried with
+        exponential backoff + jitter; this runs in a worker thread so sleeping is fine."""
+        retries = int(self.cfg.get("limit_retries", LIMIT_RETRY_DEFAULTS["limit_retries"]))
+        base = float(self.cfg.get("limit_retry_base_sec", LIMIT_RETRY_DEFAULTS["limit_retry_base_sec"]))
+        cap = float(self.cfg.get("limit_retry_max_sec", LIMIT_RETRY_DEFAULTS["limit_retry_max_sec"]))
+        total_cap = float(self.cfg.get("limit_retry_total_sec", LIMIT_RETRY_DEFAULTS["limit_retry_total_sec"]))
+        retried, waited = 0, 0.0
+        while True:
+            ok, text, info, limited = self._run_once(tier_name, prompt, cwd, tools)
+            info["retried"], info["waited_sec"] = retried, round(waited)
+            if ok or not limited or retried >= retries:
+                return ok, text, info
+            delay = min(base * 2 ** retried, cap) * random.uniform(0.8, 1.2)
+            if waited + delay > total_cap:
+                log(f"limit retry budget exhausted ({round(waited)}s waited of {round(total_cap)}s)")
+                return ok, text, info
+            retried += 1
+            log(f"rate-limit hit, waiting {round(delay)}s (retry {retried}/{retries}) tier={tier_name}")
+            time.sleep(delay)
+            waited += delay
+
+    def _run_once(self, tier_name, prompt, cwd, tools):
+        """One CLI invocation. Returns (ok, result_text, info, limited). Prompt goes
+        over stdin so it can't be swallowed by the variadic --allowedTools flag or hit
+        argv size limits."""
         cmd = self.build_cmd(tier_name, tools)
         tier = self.cfg["tiers"][tier_name]
         log(f"claude run tier={tier_name} model={tier['model']} effort={tier['effort']} cwd={cwd}")
@@ -168,7 +220,7 @@ class Claude:
             proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True)
         except OSError as e:
-            return False, "", {"error": f"failed to start claude: {e}"}
+            return False, "", {"error": f"failed to start claude: {e}"}, False
         with self.lock:
             self.procs.add(proc)
         try:
@@ -176,7 +228,7 @@ class Claude:
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.communicate()
-            return False, "", {"error": f"timed out after {self.cfg['run_timeout_sec']}s"}
+            return False, "", {"error": f"timed out after {self.cfg['run_timeout_sec']}s"}, False
         finally:
             with self.lock:
                 self.procs.discard(proc)
@@ -184,7 +236,8 @@ class Claude:
         try:
             data = json.loads(out)
         except json.JSONDecodeError:
-            return False, out.strip(), {"error": (err or out).strip()[-500:] or f"exit {proc.returncode}"}
+            return (False, out.strip(), {"error": (err or out).strip()[-500:] or f"exit {proc.returncode}"},
+                    is_retryable_limit(None, err, out))
         info = {
             "cost_usd": data.get("total_cost_usd"),
             "turns": data.get("num_turns"),
@@ -193,7 +246,7 @@ class Claude:
         ok = proc.returncode == 0 and not data.get("is_error") and data.get("subtype") == "success"
         if not ok:
             info["error"] = data.get("subtype") or (err.strip()[-500:] if err else f"exit {proc.returncode}")
-        return ok, (data.get("result") or "").strip(), info
+        return ok, (data.get("result") or "").strip(), info, (not ok and is_retryable_limit(data, err, out))
 
     def terminate_all(self):
         with self.lock:

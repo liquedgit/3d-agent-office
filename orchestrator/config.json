@@ -7,6 +7,10 @@
   "max_budget_usd": 2.00,
   "max_turns": 15,
   "run_timeout_sec": 900,
+  "limit_retries": 5,
+  "limit_retry_base_sec": 20,
+  "limit_retry_max_sec": 300,
+  "limit_retry_total_sec": 1800,
   "engineer_ids": ["eng1", "eng2", "eng3", "eng4"],
   "qa_ids": ["qa1", "qa2"],
   "tiers": {
