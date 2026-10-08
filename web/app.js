@@ -204,14 +204,17 @@ function initWorld() {
   const skyStars = [], skyBlds = [];
   {
     let s = 3; const r = () => (s = (s * 16807) % 2147483647) / 2147483647;
-    for (let i = 0; i < 24; i++) skyStars.push({ x: r() * 256, y: r() * 192 * 0.5, ph: r() * 6.28 + i });
+    for (let i = 0; i < 60; i++) skyStars.push({ x: r() * 256, y: r() * 192 * 0.5, ph: r() * 6.28 + i });
     for (let x = 0; x < 256; x += 22) {
       const bh = 30 + r() * 60, wins = [];
       for (let y = 192 - bh + 6; y < 192 - 4; y += 9) for (let xx = x + 3; xx < x + 17; xx += 7) if (r() > 0.55) wins.push({ x: xx, y, f: (xx * 7 + y * 13) % 5 === 0, ph: (xx * 31 + y * 17) % 97 });
       skyBlds.push({ x, bh, wins });
     }
   }
-  const skyClouds = [[40, 34, 26, 5], [62, 30, 18, 7], [150, 52, 22, 4], [170, 48, 15, 6], [96, 70, 16, 8]];
+  // [x, y, radius, speed]: 14 clouds, varied size/height/speed; the small slow ones (sp<=3) read as a distant layer
+  const skyClouds = [[20, 22, 30, 6], [70, 40, 22, 9], [120, 18, 34, 5], [175, 34, 26, 8], [225, 26, 20, 11],
+    [40, 62, 16, 12], [100, 58, 24, 7], [150, 74, 14, 10], [205, 66, 28, 4], [250, 50, 18, 6],
+    [10, 90, 10, 2], [85, 12, 8, 3], [135, 48, 9, 2], [190, 84, 8, 3]];
   let skyK = 0, skyDirty = true, skyLast = -1;
   function drawSky(t, k) {
     const g = skyG, w = 256, h = 192, day = 1 - k;
@@ -220,11 +223,11 @@ function initWorld() {
     g.fillStyle = gr; g.fillRect(0, 0, w, h);
     if (day > 0.01) {                                // stars + moon fade out as the day comes in
       g.fillStyle = '#fff';
-      skyStars.forEach((st) => { g.globalAlpha = day * (0.35 + 0.65 * (0.5 + 0.5 * Math.sin(t * 1.6 + st.ph))); g.fillRect(st.x, st.y, 1.5, 1.5); });
-      const mh = g.createRadialGradient(w * 0.22, h * 0.2, 3, w * 0.22, h * 0.2, 30);
-      mh.addColorStop(0, 'rgba(235,240,255,.55)'); mh.addColorStop(1, 'rgba(235,240,255,0)');
+      skyStars.forEach((st) => { g.globalAlpha = day * (0.15 + 0.85 * (0.5 + 0.5 * Math.sin(t * 2.2 + st.ph))); g.fillRect(st.x, st.y, 1.5, 1.5); });
+      const mh = g.createRadialGradient(w * 0.22, h * 0.2, 6, w * 0.22, h * 0.2, 56);
+      mh.addColorStop(0, 'rgba(235,240,255,.8)'); mh.addColorStop(0.4, 'rgba(210,225,255,.3)'); mh.addColorStop(1, 'rgba(235,240,255,0)');
       g.globalAlpha = day; g.fillStyle = mh; g.fillRect(0, 0, w, h);
-      g.fillStyle = '#eef2ff'; g.beginPath(); g.arc(w * 0.22, h * 0.2, 6, 0, Math.PI * 2); g.fill();
+      g.fillStyle = '#eef2ff'; g.beginPath(); g.arc(w * 0.22, h * 0.2, 10, 0, Math.PI * 2); g.fill();
       g.globalAlpha = 1;
     }
     if (k > 0.01) {                                  // sun with slow pulse
@@ -233,12 +236,11 @@ function initWorld() {
       sun.addColorStop(0, 'rgba(255,250,220,1)'); sun.addColorStop(0.35, 'rgba(255,240,190,' + (0.8 + 0.1 * Math.sin(t * 0.9)).toFixed(3) + ')'); sun.addColorStop(1, 'rgba(255,240,190,0)');
       g.globalAlpha = k; g.fillStyle = sun; g.fillRect(0, 0, w, h); g.globalAlpha = 1;
     }
-    // drifting soft clouds: bright by day, faint dusky wisps at night
+    // drifting soft clouds: white by day, cool grey-blue (still clearly visible) at night
     g.save(); g.filter = 'blur(2px)';
     skyClouds.forEach(([cx, cy, cr, sp], i) => {
-      const x = ((cx + t * sp * 0.6) % (w + 80)) - 40, ry = cr * 0.6;
-      g.fillStyle = mixHex('#6a7fa8', '#ffffff', k); g.globalAlpha = 0.18 + 0.67 * k;
-      if (k < 0.01 && i > 2) return;
+      const x = ((cx + t * sp * 2.5) % (w + 80)) - 40, ry = cr * 0.6;
+      g.fillStyle = mixHex('#8a9cc4', '#ffffff', k); g.globalAlpha = 0.45 + 0.4 * k;
       g.beginPath(); g.ellipse(x, cy, cr * 1.6, ry, 0, 0, Math.PI * 2); g.fill();
       g.globalAlpha *= 0.35; g.fillStyle = mixHex('#2a3550', '#8aa0bd', k);   // soft shifting underside shadow
       g.beginPath(); g.ellipse(x + 3 + Math.sin(t * 0.3 + i) * 2, cy + ry * 0.6, cr * 1.3, ry * 0.45, 0, 0, Math.PI * 2); g.fill();
@@ -702,9 +704,9 @@ function initWorld() {
   const C = (c) => new THREE.Color(c);
   const MOOD = {
     night: {
-      bg: C('#080b11'), ground: C('#06080c'), amb: C(0x8a96b8), ambI: 0.35, sky: C(0x9db8ff), gnd: C(0x3a2a1c), hemiI: 0.5,
-      key: C(0xcfe0ff), keyI: 1.15, keyPos: new THREE.Vector3(-16, 26, 14), fill: C(0xffd2a0), fillI: 0.4,
-      lamp: 55, shade: 1.1, bulb: C('#fff0cc'), pane: 0.75, facade: 0.35, exposure: 1.05,
+      bg: C('#0d1220'), ground: C('#0a0d14'), amb: C(0x8a96b8), ambI: 0.6, sky: C(0x9db8ff), gnd: C(0x3a2a1c), hemiI: 0.85,
+      key: C(0xcfe0ff), keyI: 1.15, keyPos: new THREE.Vector3(-16, 26, 14), fill: C(0xffd2a0), fillI: 0.7,
+      lamp: 85, shade: 1.1, bulb: C('#fff0cc'), pane: 0.75, facade: 0.35, exposure: 1.25,
     },
     day: {
       bg: C('#8fb8de'), ground: C('#4d5a46'), amb: C(0xfff4e2), ambI: 0.6, sky: C(0xcfe6ff), gnd: C(0x6b5a44), hemiI: 0.8,
