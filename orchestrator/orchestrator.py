@@ -519,8 +519,11 @@ Commit your work with git (clear commit message). Stay within the scope of this 
 
 End your answer with exactly one fenced JSON block:
 ```json
-{{"success": true | false, "summary": "<one or two sentences>"}}
+{{"success": true | false, "already_done": true | false, "summary": "<one or two sentences>"}}
 ```
+`already_done` is optional (default false). If you find the task is already fully implemented and merged
+(identical to what was asked, nothing left to do), set `"success": true, "already_done": true` and say
+so in the summary. Never set it to true when you did any new work or the task is only partly present.
 """
 
 QA_PROMPT = """You are {name}, a QA engineer in the Agent Office. Your current directory is the git worktree
@@ -878,8 +881,25 @@ class Orchestrator:
         if commits:
             self.office.incr("commits", commits, project=project)
 
-        success = ok and result.get("success", True) is not False and commits > 0
         summary = result.get("summary") or strip_json(text)[:300] or info.get("error") or ""
+        # Only trust already_done when the run itself succeeded (never a broken run).
+        if ok and result.get("success", True) is not False and bool(result.get("already_done")):
+            self.office.event(eng, f"Task #{tid} was already done on the branch — no new work: {summary}",
+                              "success", project=project)
+            # No QA (nothing to test). tasks_done counts completion, but floors is NOT
+            # incremented: floors = merged feature work, and this task added none.
+            self.office.task_status(tid, "done", assignee=eng, project=project)
+            self.office.incr("tasks_done", project=project)
+            # Merge (removes worktree + branch); if that fails, clean up best-effort — never fail the task.
+            merged, _err = git.merge_task(tid, title)
+            if not merged:
+                with git.lock:
+                    git.run("worktree", "remove", "--force", str(path), check=False)
+                    git.run("branch", "-D", f"task-{tid}", check=False)
+            self.office.agent(eng, "idle", current_task="", project=project)
+            return
+
+        success = ok and result.get("success", True) is not False and commits > 0
         if success:
             self.office.task_status(tid, "review", assignee=eng, project=project)
             self.office.event(eng, f"Task #{tid} implemented ({commits} commit(s)), sent to QA: {summary}",
