@@ -6,7 +6,7 @@
   "claude_bin": "claude",
   "max_budget_usd": 2.00,
   "max_turns": 15,
-  "run_timeout_sec": 900,
+  "run_timeout_sec": 1800,
   "limit_retries": 5,
   "limit_retry_base_sec": 20,
   "limit_retry_max_sec": 300,
