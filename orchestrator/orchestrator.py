@@ -9,6 +9,8 @@ runs currently in flight, so the process is safe to kill and restart.
 Task lifecycle (all derived from the server DB):
     todo --engineer--> in_progress --commit--> review --QA pass+merge--> done
                                        +--fail--> todo (blocked after N failures)
+A todo task is only picked up once every task in its depends_on is done. A blocked
+task goes back to todo after a cooldown, until it has used up its block cycles.
 """
 import argparse
 import concurrent.futures as cf
@@ -38,7 +40,7 @@ REQUIRED_TIERS = ("ceo_chat", "ceo_plan", "eng_standard", "eng_trivial",
                   "qa_tests", "qa_review", "mechanical")
 
 FULL_TOOLS = "Read,Edit,Write,Bash"
-MAX_TASK_ATTEMPTS = 3          # soft guard against burning budget on a hopeless task
+MAX_TASK_ATTEMPTS = 3          # consecutive failures before a task is blocked
 RECENT_MESSAGES = 30
 MAX_DOC_CHARS = 20000
 
@@ -55,6 +57,13 @@ LIMIT_RETRY_DEFAULTS = {
     "limit_retry_base_sec": 20,    # first backoff
     "limit_retry_max_sec": 300,    # cap per backoff
     "limit_retry_total_sec": 1800, # hard cap on total wait across retries
+}
+# Team size and blocked-task recovery; every key is optional in config.json.
+TEAM_DEFAULTS = {
+    "num_engineers": 4,            # eng1..engN
+    "num_qas": 2,                  # qa1..qaM
+    "block_cooldown_sec": 300,     # how long a blocked task rests before it is re-queued
+    "max_block_cycles": 2,         # blocked this many times -> stays blocked for good
 }
 RETRYABLE_SUBTYPES = {"rate_limit", "billing_error", "error_max_turns", "error_budget"}
 LIMIT_RE = re.compile(
@@ -102,8 +111,12 @@ def load_config(path):
         raise SystemExit(f"config: max_turns must be 1..{MAX_TURNS_CEILING}")
     if float(cfg["max_budget_usd"]) <= 0:
         raise SystemExit("config: max_budget_usd must be > 0")
-    for key, default in LIMIT_RETRY_DEFAULTS.items():
+    for key, default in {**LIMIT_RETRY_DEFAULTS, **TEAM_DEFAULTS}.items():
         cfg[key] = type(default)(cfg.get(key, default))
+    if cfg["num_engineers"] < 1 or cfg["num_qas"] < 1:
+        raise SystemExit("config: num_engineers and num_qas must be >= 1")
+    if cfg["block_cooldown_sec"] < 0 or cfg["max_block_cycles"] < 0:
+        raise SystemExit("config: block_cooldown_sec and max_block_cycles must be >= 0")
     return cfg
 
 
@@ -150,14 +163,30 @@ class Office:
                                                "current_task": current_task,
                                                "model": model, "effort": effort, "project": project})
 
-    def create_task(self, title, description, assignee=None, project=DEFAULT_PROJECT):
+    def create_task(self, title, description, assignee=None, project=DEFAULT_PROJECT, depends_on=None):
         r = self.post("/api/task", {"title": title, "description": description, "assignee": assignee,
-                                    "project": project})
+                                    "depends_on": depends_on or [], "project": project})
         return r.get("id") if r else None
 
-    def task_status(self, task_id, status, assignee=None, project=DEFAULT_PROJECT):
+    def get_task(self, task_id, project=DEFAULT_PROJECT):
+        """One task with its current counters, or None if it can't be read."""
+        try:
+            return self.get(f"/api/task/{int(task_id)}?project={urllib.parse.quote(project, safe='')}")
+        except (urllib.error.URLError, OSError) as e:
+            log(f"WARN GET task #{task_id} failed: {e}")
+            return None
+
+    def task_status(self, task_id, status, assignee=None, project=DEFAULT_PROJECT,
+                    attempts=None, block_cycles=None, blocked_until=None):
         return self.post("/api/task/status", {"task_id": task_id, "status": status, "assignee": assignee,
-                                              "project": project})
+                                              "attempts": attempts, "block_cycles": block_cycles,
+                                              "blocked_until": blocked_until, "project": project})
+
+    def sync_team(self, num_engineers, num_qas, project=DEFAULT_PROJECT):
+        """Ask the server to add any missing eng1..engN / qa1..qaM (and CEO). Returns the ids added."""
+        r = self.post("/api/team/sync", {"num_engineers": num_engineers, "num_qas": num_qas,
+                                         "project": project})
+        return r.get("added") if r else None
 
     def incr(self, key, delta=1, project=DEFAULT_PROJECT):
         return self.post("/api/metric", {"key": key, "incr": True, "delta": delta, "project": project})
@@ -381,8 +410,32 @@ def task_complexity(task):
     return m.group(1).lower() if m else "standard"
 
 
+def task_deps(task):
+    """Ids of the tasks this one waits on (tolerates a server that predates depends_on)."""
+    deps = task.get("depends_on") or []
+    if isinstance(deps, str):
+        try:
+            deps = json.loads(deps)
+        except json.JSONDecodeError:
+            return []
+    return [d for d in deps if isinstance(d, int)] if isinstance(deps, list) else []
+
+
+def plan_deps(task, index):
+    """Valid prerequisites of the planned task at 1-based position `index`: positions of
+    EARLIER tasks only, so forward, self and cyclic dependencies can't get through."""
+    out = []
+    raw = task.get("depends_on")
+    for d in raw if isinstance(raw, list) else []:
+        if isinstance(d, str) and d.strip().isdigit():
+            d = int(d)
+        if isinstance(d, int) and not isinstance(d, bool) and 1 <= d < index and d not in out:
+            out.append(d)
+    return out
+
+
 CEO_CHAT_PROMPT = """You are {ceo_name}, the CEO of a small AI software studio (the "Agent Office").
-You talk with the user (your client) and decide what the team builds. Your team: 4 engineers and 2 QA.
+You talk with the user (your client) and decide what the team builds. Your team: {num_engineers} engineers and {num_qas} QA.
 The project workspace is your current directory. You may read files but do not edit them in this step.
 
 ## Current spec.md
@@ -431,15 +484,28 @@ current directory (a git repo). The user and you have converged on what to build
 2. Write/update `BACKLOG.md`: an ordered list of NEW tasks for engineers.
 3. Break the work into small, independently implementable tasks (each one a single engineer can finish
    in ~15 tool turns, including tests). Do not duplicate existing tasks. Prefer 3-8 tasks.
+4. Declare the dependencies between the new tasks (see `depends_on` below). Engineers work in parallel,
+   each on a fresh branch of main, so a task that needs another task's code must wait for it.
 Do not implement the tasks yourself.
 
 End your answer with exactly one fenced JSON block:
 ```json
 {{"reply": "<short summary for the user of the plan>",
-  "tasks": [{{"title": "...", "description": "...", "complexity": "trivial" | "standard"}}],
+  "tasks": [{{"title": "...", "description": "...", "complexity": "trivial" | "standard",
+             "depends_on": [<1-based index>, ...]}}],
   "needs_user": false}}
 ```
 Use complexity "trivial" only for tiny mechanical edits (renames, config tweaks, copy changes).
+
+`depends_on` rules:
+- When one task needs the output of another, list the earlier task's 1-based position in `depends_on`.
+  The position is the prerequisite's place in this SAME `tasks` array (the first task is 1, the second is 2, ...).
+  It is NOT an office task id like the #numbers under "Existing tasks".
+- You may only depend on EARLIER tasks (lower index). Never list the task's own position or a later one:
+  no self, forward or cyclic dependencies. Order the array so prerequisites come first.
+- A task is not started until every task it depends on is done and merged into main.
+- Omit `depends_on` (or use []) for a task that can start right away. Only add real dependencies:
+  every one you add makes the team work in sequence instead of in parallel.
 """
 
 ENGINEER_PROMPT = """You are {name}, a software engineer in the Agent Office. Your current directory is a git
@@ -478,15 +544,16 @@ class Orchestrator:
         self.cfg = cfg
         self.office = Office(cfg["base_url"])
         self.claude = Claude(cfg)
-        self.engineers = list(cfg["engineer_ids"])
-        self.qas = list(cfg["qa_ids"])
+        self.engineers = [f"eng{i}" for i in range(1, cfg["num_engineers"] + 1)]
+        self.qas = [f"qa{i}" for i in range(1, cfg["num_qas"] + 1)]
         # Every project runs its own CEO/engineer/QA crew, so the pool is shared across rooms.
         per_project = 1 + len(self.engineers) + len(self.qas)
         self.pool = cf.ThreadPoolExecutor(max_workers=int(cfg.get("max_concurrent_runs", 2 * per_project)))
         # Runs currently in flight, keyed "<project>|ceo", "<project>|eng:<task>", "<project>|qa:<task>"
         # -> (project, agent_id, future). Agent and task ids repeat across projects, hence the prefix.
         self.inflight = {}
-        self.attempts = {}  # (project, task_id) -> failed attempts this process lifetime (soft guard only)
+        self.waiting = {}   # (project, task_id) -> unmet deps last reported (log dedupe only)
+        self.warned_old_server = False
         self.gits = {}      # project -> Git for <workspace>/<project>/
         self.gits_lock = threading.Lock()
         self.stopping = False
@@ -545,12 +612,35 @@ class Orchestrator:
         for project in projects:
             try:
                 state = self.office.state(project)
+                if self.sync_team(project, state):
+                    state = self.office.state(project)  # pick up the new hires
             except (urllib.error.URLError, OSError) as e:
                 log(f"WARN [{project}] state poll failed: {e}")
                 continue
+            tasks = state.get("tasks", [])
+            if tasks and "depends_on" not in tasks[0] and not self.warned_old_server:
+                self.warned_old_server = True
+                log("WARN office server predates task dependencies / blocked recovery — "
+                    "rebuild and restart it, until then both are inactive")
             self.schedule_ceo(state, project)
             self.schedule_engineers(state, project)
             self.schedule_qa(state, project)
+
+    def sync_team(self, project, state):
+        """Make sure the project's office has the CEO and every configured engineer/QA.
+        Returns True if anyone was added. No request at all when the team is complete;
+        surplus agents from a larger past config are left to idle (never scheduled)."""
+        have = {a["id"] for a in state.get("agents", [])}
+        if have.issuperset(["ceo", *self.engineers, *self.qas]):
+            return False
+        added = self.office.sync_team(len(self.engineers), len(self.qas), project)
+        if added is None:
+            log(f"WARN [{project}] team sync failed; missing agents won't show in the office")
+        if not added:
+            return False
+        self.office.event("ceo", f"Team is now {len(self.engineers)} engineer(s) and {len(self.qas)} QA "
+                                 f"(joined: {', '.join(added)})", "info", project=project)
+        return True
 
     def reap(self):
         for key, (project, agent_id, fut) in list(self.inflight.items()):
@@ -594,9 +684,13 @@ class Orchestrator:
     def _context(self, state, project):
         convo = state.get("conversation", [])[-RECENT_MESSAGES:]
         conversation = "\n".join(f"{m['speaker'].upper()}: {m['message']}" for m in convo) or "(empty)"
-        tasks = "\n".join(f"#{t['id']} [{t['status']}] {t['title']}" for t in state.get("tasks", [])) or "(none)"
+        tasks = "\n".join(
+            f"#{t['id']} [{t['status']}] {t['title']}"
+            + (f" (after {', '.join(f'#{d}' for d in task_deps(t))})" if task_deps(t) else "")
+            for t in state.get("tasks", [])) or "(none)"
         ws = self.git(project).ws
         return dict(conversation=conversation, tasks=tasks, ceo_name=self.ceo_name(state),
+                    num_engineers=len(self.engineers), num_qas=len(self.qas),
                     spec=read_doc(ws / "spec.md"), backlog=read_doc(ws / "BACKLOG.md"))
 
     def run_ceo(self, state, project):
@@ -644,7 +738,9 @@ class Orchestrator:
         self.office.event("ceo", "CEO architecting: writing spec.md and BACKLOG.md", "think", project=project)
         ok, text, info = self.claude.run("ceo_plan", CEO_PLAN_PROMPT.format(**ctx), ws)
         plan = extract_json(text) or {}
-        tasks = [t for t in plan.get("tasks") or [] if isinstance(t, dict) and t.get("title")]
+        planned = plan.get("tasks") if isinstance(plan.get("tasks"), list) else []
+        # Keep each task's 1-based position in the CEO's array: depends_on refers to it.
+        tasks = [(i, t) for i, t in enumerate(planned, 1) if isinstance(t, dict) and t.get("title")]
         if not ok and not tasks:
             self.office.event("ceo", f"Planning failed: {info.get('error')}", "error", project=project)
             self.office.message("ceo", "I couldn't finish the plan just now — I'll need another go. "
@@ -654,15 +750,28 @@ class Orchestrator:
 
         with git.lock:
             git.commit_all("CEO: update spec and backlog")
-        for t in tasks:
+        index_map = {}  # 1-based position in the plan -> real task id
+        for index, t in tasks:
             complexity = "trivial" if str(t.get("complexity", "")).lower() == "trivial" else "standard"
             desc = f"{(t.get('description') or '').strip()}\n\ncomplexity: {complexity}"
-            tid = self.office.create_task(t["title"].strip()[:200], desc, project=project)
-            self.office.event("ceo", f"Created task #{tid}: {t['title']}", "info", project=project)
+            # Prerequisites are always earlier in the plan, so their real ids are already known and
+            # the task is created with its deps in place: it is never schedulable without them.
+            kept = [i for i in plan_deps(t, index) if i in index_map]
+            deps = [index_map[i] for i in kept]
+            if (t.get("depends_on") or []) != kept:
+                log(f"[{project}] plan task {index}: depends_on {t['depends_on']!r} -> kept positions {kept} "
+                    f"(earlier, created tasks only)")
+            tid = self.office.create_task(t["title"].strip()[:200], desc, project=project, depends_on=deps)
+            if tid is None:
+                self.office.event("ceo", f"Could not create task: {t['title']}", "error", project=project)
+                continue
+            index_map[index] = tid
+            after = f" (depends on {', '.join(f'#{d}' for d in deps)})" if deps else ""
+            self.office.event("ceo", f"Created task #{tid}: {t['title']}{after}", "info", project=project)
 
         reply = (plan.get("reply") or strip_json(text) or "Plan ready.").strip()
         self.office.message("ceo", reply, project=project)
-        self.office.event("ceo", f"Plan ready: {len(tasks)} task(s) delegated (${info.get('cost_usd') or 0:.3f})",
+        self.office.event("ceo", f"Plan ready: {len(index_map)} task(s) delegated (${info.get('cost_usd') or 0:.3f})",
                           "success", project=project)
         if plan.get("needs_user"):
             self.notify_discord("question", reply, last_user, project)
@@ -694,17 +803,52 @@ class Orchestrator:
     # ---- engineers
 
     def schedule_engineers(self, state, project):
+        tasks = state.get("tasks", [])
+        self.requeue_blocked(tasks, project)
+        status = {t["id"]: t["status"] for t in tasks}  # one project's tasks: deps never cross projects
         busy = self.busy_agents(project)
         idle = [e for e in self.engineers if e not in busy]
-        for t in state.get("tasks", []):
+        for t in tasks:
             if not idle:
                 break
             if t["status"] != "todo" or self.key(project, f"eng:{t['id']}") in self.inflight:
                 continue
+            if self.waiting_on_deps(project, t, status):
+                continue  # stays todo until its prerequisites are done
             eng = idle.pop(0)
             self.office.task_status(t["id"], "in_progress", assignee=eng, project=project)
             self.submit(project, f"eng:{t['id']}", eng, self.run_engineer,
                         project, eng, t, self.agent_name(state, eng))
+
+    def requeue_blocked(self, tasks, project):
+        """Auto-recovery: a blocked task whose cooldown has passed goes back to todo,
+        unless it has already used up its block cycles (then it stays blocked for good)."""
+        now = int(time.time())
+        for t in tasks:
+            until = int(t.get("blocked_until") or 0)
+            cycles = int(t.get("block_cycles") or 0)
+            if t["status"] != "blocked" or not until or until > now or cycles >= self.cfg["max_block_cycles"]:
+                continue
+            if self.office.task_status(t["id"], "todo", blocked_until=0, project=project) is None:
+                continue  # server hiccup: try again next cycle
+            t["status"] = "todo"  # schedulable in this same cycle
+            self.office.event("ceo", f"Re-queued blocked task #{t['id']} after cooldown "
+                                     f"(block cycle {cycles}/{self.cfg['max_block_cycles']})", "info",
+                              project=project)
+
+    def waiting_on_deps(self, project, task, status):
+        """True while the task has a dependency that isn't done. A dependency that doesn't
+        exist in this project counts as unmet. Reported only when the unmet set changes."""
+        k = (project, task["id"])
+        unmet = [d for d in task_deps(task) if status.get(d) != "done"]
+        if not unmet:
+            self.waiting.pop(k, None)
+            return False
+        if self.waiting.get(k) != unmet:
+            self.waiting[k] = unmet
+            names = ", ".join(f"#{d}" + ("" if d in status else " (missing)") for d in unmet)
+            self.office.event("ceo", f"Task #{task['id']} waiting on {names}", "info", project=project)
+        return True
 
     @staticmethod
     def agent_name(state, agent_id):
@@ -745,15 +889,33 @@ class Orchestrator:
         self.office.agent(eng, "idle", current_task="", project=project)
 
     def fail_task(self, project, tid, agent_id, message):
-        k = (project, tid)
-        self.attempts[k] = self.attempts.get(k, 0) + 1
-        if self.attempts[k] >= MAX_TASK_ATTEMPTS:
+        """Count a failure against the task. The counters live in the DB, so they survive
+        restarts: retry at once until MAX_TASK_ATTEMPTS, then block for a cooldown
+        (requeue_blocked brings it back) until max_block_cycles is reached."""
+        task = self.office.get_task(tid, project)
+        if not task or "attempts" not in task:
+            # Without the persisted counters a retry could loop forever: stop here instead.
             self.office.task_status(tid, "blocked", project=project)
-            self.office.event(agent_id, f"{message} — blocked after {self.attempts[k]} attempts", "error",
+            self.office.event(agent_id, f"{message} — blocked: could not read its retry counters from the server",
+                              "error", project=project)
+            return
+        attempts = int(task.get("attempts") or 0) + 1
+        if attempts < MAX_TASK_ATTEMPTS:
+            self.office.task_status(tid, "todo", attempts=attempts, project=project)
+            self.office.event(agent_id, f"{message} (attempt {attempts}/{MAX_TASK_ATTEMPTS}, retrying)", "error",
                               project=project)
+            return
+        cycles = int(task.get("block_cycles") or 0) + 1
+        max_cycles = self.cfg["max_block_cycles"]
+        cooldown = self.cfg["block_cooldown_sec"]
+        self.office.task_status(tid, "blocked", attempts=0, block_cycles=cycles,
+                                blocked_until=int(time.time()) + cooldown, project=project)
+        if cycles >= max_cycles:
+            self.office.event(agent_id, f"{message} — blocked permanently — needs CEO/user "
+                                        f"(cycle {cycles}/{max_cycles})", "error", project=project)
         else:
-            self.office.task_status(tid, "todo", project=project)
-            self.office.event(agent_id, message, "error", project=project)
+            self.office.event(agent_id, f"{message} — blocked (cycle {cycles}/{max_cycles}), "
+                                        f"retrying in {cooldown}s", "error", project=project)
 
     # ---- QA
 

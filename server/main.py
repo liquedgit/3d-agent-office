@@ -13,6 +13,8 @@ except ImportError:
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
+MAX_TEAM_PER_ROLE = 48  # sanity cap for /api/team/sync
+
 app = FastAPI(title="Agent Office")
 
 
@@ -147,17 +149,54 @@ async def post_status(payload: dict, project: str | None = None):
 @app.post("/api/task")
 async def post_task(payload: dict, project: str | None = None):
     pid = resolve_project(payload, project)
-    tid = db.create_task(payload["title"], payload.get("description", ""), payload.get("assignee"), project=pid)
+    tid = db.create_task(payload["title"], payload.get("description", ""), payload.get("assignee"), project=pid,
+                         depends_on=payload.get("depends_on"))
     notify(pid)
     return {"ok": True, "id": tid}
 
 
+@app.get("/api/task/{task_id}")
+def get_task(task_id: int, project: str | None = None):
+    task = db.get_task(task_id, resolve_project(project=project))
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"unknown task: {task_id}")
+    return JSONResponse(task)
+
+
 @app.post("/api/task/status")
 async def post_task_status(payload: dict, project: str | None = None):
+    """{task_id, status, assignee?} plus optional recovery counters {attempts, block_cycles, blocked_until}."""
     pid = resolve_project(payload, project)
-    db.set_task_status(payload["task_id"], payload["status"], payload.get("assignee"), project=pid)
+    db.set_task_status(payload["task_id"], payload["status"], payload.get("assignee"), project=pid,
+                       attempts=payload.get("attempts"), block_cycles=payload.get("block_cycles"),
+                       blocked_until=payload.get("blocked_until"))
     notify(pid)
     return {"ok": True}
+
+
+@app.post("/api/task/deps")
+async def post_task_deps(payload: dict, project: str | None = None):
+    """Replace a task's dependencies: {task_id, depends_on: [task ids in the same project]}."""
+    pid = resolve_project(payload, project)
+    db.set_task_deps(payload["task_id"], payload.get("depends_on") or [], project=pid)
+    notify(pid)
+    return {"ok": True}
+
+
+@app.post("/api/team/sync")
+async def post_team_sync(payload: dict, project: str | None = None):
+    """Grow the project's team to {num_engineers, num_qas} -> {ok, added: [agent ids]}."""
+    pid = resolve_project(payload, project)
+    try:
+        num_engineers, num_qas = int(payload["num_engineers"]), int(payload["num_qas"])
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="num_engineers and num_qas are required integers")
+    if not (0 <= num_engineers <= MAX_TEAM_PER_ROLE and 0 <= num_qas <= MAX_TEAM_PER_ROLE):
+        raise HTTPException(status_code=400, detail=f"team counts must be 0..{MAX_TEAM_PER_ROLE}")
+    added = db.sync_team(num_engineers, num_qas, project=pid)
+    if added:
+        notify(pid)
+    return {"ok": True, "added": added}
 
 
 @app.post("/api/metric")

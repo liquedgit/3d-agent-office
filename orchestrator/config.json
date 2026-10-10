@@ -11,8 +11,10 @@
   "limit_retry_base_sec": 20,
   "limit_retry_max_sec": 300,
   "limit_retry_total_sec": 1800,
-  "engineer_ids": ["eng1", "eng2", "eng3", "eng4"],
-  "qa_ids": ["qa1", "qa2"],
+  "num_engineers": 4,
+  "num_qas": 2,
+  "block_cooldown_sec": 300,
+  "max_block_cycles": 2,
   "tiers": {
     "ceo_chat":      {"model": "sonnet", "effort": "medium"},
     "ceo_plan":      {"model": "opus",   "effort": "high"},
