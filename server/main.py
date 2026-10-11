@@ -1,9 +1,11 @@
 """FastAPI server: serves the office dashboard + streams live state over WebSocket."""
 import asyncio
+import os
+import secrets
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 try:
@@ -15,7 +17,56 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 MAX_TEAM_PER_ROLE = 48  # sanity cap for /api/team/sync
 
+OFFICE_PASSWORD = os.environ.get("OFFICE_PASSWORD", "")  # empty -> auth disabled
+OFFICE_SESSION_COOKIE = "office_session"
+SESSIONS: set[str] = set()  # in-memory session tokens
+
 app = FastAPI(title="Agent Office")
+
+
+def _authed(request) -> bool:
+    if not OFFICE_PASSWORD:
+        return True
+    key = request.headers.get("x-office-key", "")
+    if key and secrets.compare_digest(key, OFFICE_PASSWORD):
+        return True
+    return request.cookies.get(OFFICE_SESSION_COOKIE) in SESSIONS
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+    if path in ("/login", "/logout") or _authed(request):
+        return await call_next(request)
+    if path.startswith("/api/"):
+        return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return RedirectResponse("/login", status_code=307)
+
+
+@app.get("/login")
+def login_page():
+    return FileResponse(WEB_DIR / "login.html")
+
+
+@app.post("/login")
+async def login_submit(payload: dict):
+    # JSON body {"password": "..."}; avoids needing python-multipart.
+    pw = payload.get("password")
+    if OFFICE_PASSWORD and isinstance(pw, str) and secrets.compare_digest(pw, OFFICE_PASSWORD):
+        token = secrets.token_urlsafe(32)
+        SESSIONS.add(token)
+        resp = JSONResponse({"ok": True})
+        resp.set_cookie(OFFICE_SESSION_COOKIE, token, httponly=True, samesite="lax")
+        return resp
+    return JSONResponse({"ok": False, "error": "wrong password"}, status_code=401)
+
+
+@app.post("/logout")
+def logout(request: Request):
+    SESSIONS.discard(request.cookies.get(OFFICE_SESSION_COOKIE, ""))
+    resp = RedirectResponse("/login", status_code=307)
+    resp.delete_cookie(OFFICE_SESSION_COOKIE)
+    return resp
 
 
 @app.on_event("startup")
@@ -224,6 +275,9 @@ async def post_message(payload: dict, project: str | None = None):
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket, project: str | None = None):
     """`/ws?project=<id>` streams that project's snapshots (unknown/absent -> 'default')."""
+    if OFFICE_PASSWORD and ws.cookies.get(OFFICE_SESSION_COOKIE) not in SESSIONS:
+        await ws.close(code=1008)
+        return
     pid = project if project and db.project_exists(project) else db.DEFAULT_PROJECT
     await ws.accept()
     CLIENTS[ws] = pid

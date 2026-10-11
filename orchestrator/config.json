@@ -1,5 +1,6 @@
 {
   "base_url": "http://127.0.0.1:8765",
+  "office_key": "",
   "poll_interval_sec": 3,
   "workspace": "~/agent-office/workspace",
   "pending_discord_file": "~/agent-office/pending_discord.jsonl",

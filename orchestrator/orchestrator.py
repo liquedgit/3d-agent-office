@@ -97,6 +97,7 @@ def load_config(path):
     for key in ("workspace", "pending_discord_file"):
         cfg[key] = str(Path(os.path.expanduser(cfg[key])))
     cfg["base_url"] = cfg["base_url"].rstrip("/")
+    cfg["office_key"] = os.environ.get("OFFICE_KEY", "") or cfg.get("office_key", "")
 
     tiers = cfg.get("tiers", {})
     for name in REQUIRED_TIERS:
@@ -123,13 +124,16 @@ def load_config(path):
 # ---------------------------------------------------------------- office server API
 
 class Office:
-    def __init__(self, base_url):
+    def __init__(self, base_url, key=""):
         self.base = base_url
+        self.key = key
 
     def _req(self, method, path, payload=None):
         data = json.dumps(payload).encode() if payload is not None else None
-        req = urllib.request.Request(self.base + path, data=data, method=method,
-                                     headers={"Content-Type": "application/json"})
+        headers = {"Content-Type": "application/json"}
+        if self.key:
+            headers["X-Office-Key"] = self.key
+        req = urllib.request.Request(self.base + path, data=data, method=method, headers=headers)
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read() or b"null")
 
@@ -545,7 +549,7 @@ End your answer with exactly one fenced JSON block:
 class Orchestrator:
     def __init__(self, cfg):
         self.cfg = cfg
-        self.office = Office(cfg["base_url"])
+        self.office = Office(cfg["base_url"], cfg.get("office_key", ""))
         self.claude = Claude(cfg)
         self.engineers = [f"eng{i}" for i in range(1, cfg["num_engineers"] + 1)]
         self.qas = [f"qa{i}" for i in range(1, cfg["num_qas"] + 1)]

@@ -7,6 +7,7 @@ services:
       - "0.0.0.0:8765:8765"
     environment:
       - OFFICE_DB=/app/data/office.db
+      - OFFICE_PASSWORD=${OFFICE_PASSWORD:-}
     volumes:
       - ./data:/app/data      # persistent DB
       - ./web:/app/web        # frontend (edit on host, live in container)
